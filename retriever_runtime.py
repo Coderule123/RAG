@@ -1,0 +1,39 @@
+from typing import Dict, List
+
+from langchain_community.vectorstores import FAISS
+
+from RAG.config.logger_runtime import get_logger
+
+logger = get_logger("rag")
+
+
+class RetrieverRuntime:
+    """
+    从本地 FAISS 目录加载向量库并做相似度检索。
+    注意：查询必须先经与建库相同的 Embedding 编码；故 rag_api 仍须初始化 EmbeddingService。
+    """
+
+    def __init__(self, faiss_dir: str, embeddings_model):
+        logger.info("加载向量库: %s", faiss_dir)
+        # LangChain 在检索时会对 query 调用 embeddings_model.model.embed_query
+        self.store = FAISS.load_local(
+            faiss_dir,
+            embeddings=embeddings_model.model,
+            allow_dangerous_deserialization=True,
+        )
+        logger.info("向量库加载完成")
+
+    def retrieve(self, query: str, top_k: int) -> List[Dict]:
+        """返回带 text、metadata、vector_score 的字典列表（分数依 LangChain 实现）。"""
+        logger.info("开始检索: query=%s top_k=%s", query, top_k)
+        docs = self.store.similarity_search_with_relevance_scores(query, k=top_k)
+        results = [
+            {
+                "text": doc.page_content,
+                "metadata": doc.metadata,
+                "vector_score": float(score),
+            }
+            for doc, score in docs
+        ]
+        logger.info("检索完成: hits=%s", len(results))
+        return results

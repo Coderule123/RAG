@@ -1,0 +1,8 @@
+.vscode/
+*.pyc
+**/venv/
+**/logs/
+**.log
+/assets/data/*
+/assets/index_store/*
+/assets/models/*

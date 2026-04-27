@@ -1,0 +1,37 @@
+# =============================================================================
+# RAG 项目配置
+# 说明：当前 RAG 阶段仅「检索 → 重排 → 拼上下文 → 生成 prompt」
+# =============================================================================
+
+# 目录：知识库、向量索引、模型缓存、日志
+paths:
+  data_dir: "./RAG/assets/data"                 # 待入库文档根目录（DP 读取）
+  index_dir: "./RAG/assets/index_store"         # 向量库与 metadata/sqlite 根目录
+  logs_dir: "./RAG/logs"                        # RAG 运行时脚本日志（RAG/rag_api.py）
+  doc_logs_dir: "./RAG/logs/doc"                # 文档预处理日志（DP/document_processor.py）
+  models_dir: "./RAG/assets/models"             # HF 模型缓存（与 huggingface 段配合）
+
+# 模型 ID：须与建库时一致，否则检索向量空间不匹配
+models:
+  embedding_model: "BAAI/bge-small-zh-v1.5"   # 查询向量与 FAISS 建库用同一套
+  reranker_model: "BAAI/bge-reranker-v2-m3"   # CrossEncoder 精排
+
+# 检索与重排（RAG/rag_api.py 可用 CLI 覆盖）
+retrieval:
+  top_k: 8              # 向量召回条数
+  rerank_top_n: 4       # 重排后保留条数
+  use_reranker: false   # 是否启用重排，设为 false 则跳过重排步骤
+
+# 切分与入库（DP/document_processor.py）
+vector_index:
+  chunk_size: 500
+  overlap: 80
+  batch_size: 128       # 预留：当前入库为整批 add_documents，可按需改批处理
+  incremental: true     # true：在已有 faiss_store 上追加；false：全量重建
+
+# Hugging Face：镜像、缓存目录、离线
+huggingface:
+  mirror_enabled: true
+  endpoint: "https://hf-mirror.com"
+  local_files_only: true    # 仅本地模型（需事先把模型放到 assets/models 下）
+  offline_mode: true       # true 时强制 HF_HUB_OFFLINE，完全禁止联网
