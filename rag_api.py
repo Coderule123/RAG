@@ -126,6 +126,7 @@ class RAGService:
 
         # 参数默认值
         retrieval_cfg = self.config.get("retrieval", {})
+        vector_threshold = retrieval_cfg.get("vector_threshold", 0.6)
         top_k = top_k if top_k is not None else int(retrieval_cfg.get("top_k", 8))
         rerank_top_n = (
             rerank_top_n
@@ -152,7 +153,7 @@ class RAGService:
 
         # 构建上下文和 Prompt
         t2 = time.perf_counter()
-        context = build_context(reranked)
+        context = build_context(reranked, vector_threshold=vector_threshold)
         prompt = build_prompt(query, context)
         timings["build_context_prompt"] = time.perf_counter() - t2
         timings["total"] = (
