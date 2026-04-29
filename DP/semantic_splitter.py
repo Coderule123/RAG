@@ -1,3 +1,4 @@
+import re
 from typing import List
 
 from RAG.config.logger_runtime import get_logger
@@ -5,6 +6,12 @@ from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 logger = get_logger("rag")
+
+
+def normalize_for_dedup(text: str) -> str:
+    """用于精确去重的轻量归一化：忽略空白与大小写差异。"""
+    normalized = re.sub(r"\s+", "", text or "").lower()
+    return normalized.strip()
 
 
 def build_splitter(chunk_size: int, overlap: int) -> RecursiveCharacterTextSplitter:
@@ -43,10 +50,33 @@ def split_documents(
     )
     splitter = build_splitter(chunk_size, overlap)
     chunks: List[Document] = []
+    seen_docs = set()
+    seen_chunks = set()
+    skipped_duplicate_docs = 0
+    skipped_duplicate_chunks = 0
     for doc_idx, doc in enumerate(docs):
+        doc_key = normalize_for_dedup(doc.page_content)
+        if not doc_key:
+            continue
+        if doc_key in seen_docs:
+            skipped_duplicate_docs += 1
+            continue
+        seen_docs.add(doc_key)
         parts = splitter.split_text(doc.page_content)
         for chunk_idx, part in enumerate(parts):
+            normalized = normalize_for_dedup(part)
+            if not normalized:
+                continue
+            if normalized in seen_chunks:
+                skipped_duplicate_chunks += 1
+                continue
+            seen_chunks.add(normalized)
             meta = {**doc.metadata, "doc_id": doc_idx, "chunk_id": chunk_idx}
             chunks.append(Document(page_content=part, metadata=meta))
-    logger.info("语义切分完成: chunks=%s", len(chunks))
+    logger.info(
+        "语义切分完成: chunks=%s skipped_duplicate_docs=%s skipped_duplicate_chunks=%s",
+        len(chunks),
+        skipped_duplicate_docs,
+        skipped_duplicate_chunks,
+    )
     return chunks
