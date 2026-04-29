@@ -34,6 +34,7 @@ def build_parser(config: dict) -> argparse.ArgumentParser:
     )
     parser.add_argument("--chunk-size", type=int, default=vector.get("chunk_size", 500))
     parser.add_argument("--overlap", type=int, default=vector.get("overlap", 80))
+    parser.add_argument("--batch-size", type=int, default=vector.get("batch_size", 128))
     parser.add_argument(
         "--embedding-model",
         default=models.get("embedding_model", "BAAI/bge-small-zh-v1.5"),
@@ -65,6 +66,7 @@ def main() -> None:
             index_dir=paths.get("index_dir", "./assets/index_store"),
             chunk_size=int(vector.get("chunk_size", 500)),
             overlap=int(vector.get("overlap", 80)),
+            batch_size=int(vector.get("batch_size", 128)),
             incremental=bool(vector.get("incremental", True)),
             embedding_model=models.get("embedding_model", "BAAI/bge-small-zh-v1.5"),
         )
@@ -74,7 +76,25 @@ def main() -> None:
         logger.info("CLI 模式运行")
 
     logger.info("开始文档处理流程")
-    docs, failed_files = load_documents(args.data_dir)
+    metadata_path = str(Path(args.index_dir) / "metadata.json")
+    docs, load_stats = load_documents(
+        args.data_dir,
+        incremental=args.incremental,
+        metadata_path=metadata_path,
+    )
+    if not docs:
+        result = {
+            "document_count": 0,
+            "chunk_count": 0,
+            "total_chunks": 0,
+            "message": "没有新增或变更文档",
+            "metadata_path": metadata_path,
+            **load_stats,
+        }
+        logger.info("无新增文档，流程结束")
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return
+
     chunks = split_documents(docs, args.chunk_size, args.overlap)
 
     embed = EmbeddingService(
@@ -83,12 +103,17 @@ def main() -> None:
         local_files_only=bool(hf_cfg.get("local_files_only", False)),
     )
     store = VectorStore(index_dir=args.index_dir)
-    result = store.build_or_append(chunks, embed, incremental=args.incremental)
+    result = store.build_or_append(
+        chunks,
+        embed,
+        incremental=args.incremental,
+        batch_size=args.batch_size,
+    )
     result.update(
         {
             "document_count": len(docs),
-            "chunk_count": len(chunks),
-            "failed_files": failed_files,
+            "chunk_count": result.get("added_chunks", len(chunks)),
+            **load_stats,
         }
     )
     logger.info("文档处理流程完成")
