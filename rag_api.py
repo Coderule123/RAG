@@ -113,11 +113,44 @@ class RAGService:
 
         logger.info("RAGService 初始化完成（模型已加载）")
 
+    def _print_result(self, result: Dict[str, Any]) -> None:
+        """打印 RAG 结果的详细信息（日志+控制台），与原有 print_rag_result 功能一致"""
+        logger.info("检索耗时: %.4fs", result["timings"]["retrieve"])
+        logger.info("重排耗时: %.4fs", result["timings"]["rerank"])
+        logger.info(
+            "上下文与提示词构建耗时: %.4fs", result["timings"]["build_context_prompt"]
+        )
+        logger.info("总耗时(不含LLM): %.4fs", result["timings"]["total"])
+
+        output = {
+            "query": result["query"],
+            "retrieved_count": len(result["retrieved_docs"]),
+            "reranked_count": len(result["reranked_docs"]),
+        }
+        logger.info("RAG 运行时输出:\n%s", json.dumps(output, ensure_ascii=False, indent=2))
+
+        logger.info("=" * 60)
+        logger.info("context一览:")
+        for idx, doc in enumerate(result["reranked_docs"], 1):
+            logger.info(f"片段 {idx}:")
+            logger.info(doc.get("text", ""))
+            logger.info(f"元数据: {doc.get('metadata', {})}")
+            logger.info(
+                f"向量分: {doc.get('vector_score')}, 重排分: {doc.get('rerank_score')}"
+            )
+        logger.info("-" * 40)
+
+        logger.info("=" * 60)
+        logger.info("生成的 Prompt（供 LLM 使用）:")
+        logger.info(result["prompt"])
+        logger.info("=" * 60)
+
     def query(
         self,
         query: str,
         top_k: Optional[int] = None,
         rerank_top_n: Optional[int] = None,
+        verbose: bool = True,
     ) -> Dict[str, Any]:
         """执行完整的 RAG 流程：检索 → 重排 → 构建上下文 → 生成 Prompt。"""
         if not query or not query.strip():
@@ -160,7 +193,7 @@ class RAGService:
             timings["retrieve"] + timings["rerank"] + timings["build_context_prompt"]
         )
 
-        return {
+        result = {
             "query": query,
             "retrieved_docs": retrieved,
             "reranked_docs": reranked,
@@ -168,6 +201,10 @@ class RAGService:
             "prompt": prompt,
             "timings": timings,
         }
+        if verbose:
+            self._print_result(result)
+
+        return result
 
 
 def print_rag_result(result: Dict[str, Any]) -> None:
@@ -222,10 +259,9 @@ def interactive_mode(rag_service: RAGService, top_k: int, rerank_top_n: int) -> 
             continue
 
         try:
-            result = rag_service.query(
+            rag_service.query(
                 user_input, top_k=top_k, rerank_top_n=rerank_top_n
             )
-            print_rag_result(result)
         except Exception as e:
             print(f"处理问题时出错: {e}")
             logger.exception("交互模式查询异常")
@@ -246,12 +282,11 @@ def main() -> None:
         if not query:
             raise ValueError("query 不能为空")
 
-        result = rag_service.query(
+        rag_service.query(
             query=query,
             top_k=args.top_k,
             rerank_top_n=args.rerank_top_n,
         )
-        print_rag_result(result)
         logger.info("完成一次 RAG 服务流程")
     else:
         # 交互模式
