@@ -14,7 +14,7 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from RAG.config.config_runtime import load_config
 from RAG.config.hf_runtime import setup_huggingface_env
@@ -44,6 +44,11 @@ def build_parser(config: dict) -> argparse.ArgumentParser:
     parser.add_argument("--top-k", type=int, default=int(retrieval.get("top_k", 8)))
     parser.add_argument(
         "--rerank-top-n", type=int, default=int(retrieval.get("rerank_top_n", 4))
+    )
+    parser.add_argument(
+        "--user-id",
+        default=None,
+        help="当前用户姓名（可选）；也可在问题末尾使用「  --姓名」，例如：RAG是什么？ --张三",
     )
     return parser
 
@@ -150,6 +155,7 @@ class RAGService:
         query: str,
         top_k: Optional[int] = None,
         rerank_top_n: Optional[int] = None,
+        user_id: Optional[str] = None,
         verbose: bool = True,
     ) -> Dict[str, Any]:
         """执行完整的 RAG 流程：检索 → 重排 → 构建上下文 → 生成 Prompt。"""
@@ -187,7 +193,7 @@ class RAGService:
         # 构建上下文和 Prompt
         t2 = time.perf_counter()
         context = build_context(reranked, vector_threshold=vector_threshold)
-        prompt = build_prompt(query, context)
+        prompt = build_prompt(query, context, user_id=user_id)
         timings["build_context_prompt"] = time.perf_counter() - t2
         timings["total"] = (
             timings["retrieve"] + timings["rerank"] + timings["build_context_prompt"]
@@ -205,6 +211,22 @@ class RAGService:
             self._print_result(result)
 
         return result
+
+
+def split_query_user_suffix(text: str) -> Tuple[str, Optional[str]]:
+    """
+    从输入中解析「问题 + 可选后缀  --姓名」。
+    使用自右向左最后一次出现的「  --」分割，前面为检索用问题，后面为 user_id。
+    """
+    text = text.strip()
+    if " --" not in text:
+        return text, None
+    question, suffix = text.rsplit(" --", 1)
+    question = question.strip()
+    suffix = suffix.strip()
+    if not suffix:
+        return text, None
+    return question, suffix
 
 
 def print_rag_result(result: Dict[str, Any]) -> None:
@@ -242,7 +264,10 @@ def print_rag_result(result: Dict[str, Any]) -> None:
 
 def interactive_mode(rag_service: RAGService, top_k: int, rerank_top_n: int) -> None:
     """交互式模式：循环读取用户输入，输出 RAG 结果，输入 exit 退出。"""
-    print("\n进入 RAG 交互模式，输入问题后按回车查看结果，输入 exit 或 quit 退出。")
+    print(
+        "\n进入 RAG 交互模式，输入问题后按回车查看结果，输入 exit 或 quit 退出。\n"
+        "可选在问题末尾附带姓名：「问题  --姓名」，例如：RAG是什么？ --张三"
+    )
     while True:
         try:
             user_input = input("\n请输入问题: ").strip()
@@ -258,9 +283,17 @@ def interactive_mode(rag_service: RAGService, top_k: int, rerank_top_n: int) -> 
             print("问题不能为空，请重新输入。")
             continue
 
+        question, inline_user_id = split_query_user_suffix(user_input)
+        if not question:
+            print("问题不能为空（去掉「  --姓名」后无有效问题），请重新输入。")
+            continue
+
         try:
             rag_service.query(
-                user_input, top_k=top_k, rerank_top_n=rerank_top_n
+                question,
+                top_k=top_k,
+                rerank_top_n=rerank_top_n,
+                user_id=inline_user_id,
             )
         except Exception as e:
             print(f"处理问题时出错: {e}")
@@ -278,14 +311,26 @@ def main() -> None:
     if args.query is not None:
         # 单次查询模式
         logger.info("开始 RAG 流程（检索->重排->上下文->Prompt）")
-        query = args.query.strip()
-        if not query:
+        raw = args.query.strip()
+        if not raw:
             raise ValueError("query 不能为空")
 
+        question, inline_user_id = split_query_user_suffix(raw)
+        if not question:
+            raise ValueError("query 不能为空（去掉「  --姓名」后无有效问题）")
+
+        cli_user_id = (
+            args.user_id.strip()
+            if args.user_id is not None and str(args.user_id).strip()
+            else None
+        )
+        user_id = cli_user_id if cli_user_id is not None else inline_user_id
+
         rag_service.query(
-            query=query,
+            query=question,
             top_k=args.top_k,
             rerank_top_n=args.rerank_top_n,
+            user_id=user_id,
         )
         logger.info("完成一次 RAG 服务流程")
     else:

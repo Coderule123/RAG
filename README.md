@@ -58,6 +58,8 @@ python3 -m DP.document_processor \
 export HF_ENDPOINT=https://hf-mirror.com
 cd /home/ymrobot/ws/ymbot/ASR_LLM_TTS/chat_assistant
 python3 -m RAG.rag_api --query "什么是RAG？"
+python3 -m RAG.rag_api --query "RAG是什么？ --张三"
+python3 -m RAG.rag_api --query "RAG是什么？" --user-id "张三"
 ```
 
 输出是 JSON，包含：
