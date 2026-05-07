@@ -11,6 +11,9 @@ python3 -m venv venv
 source venv/bin/activate
 pip install -U pip
 pip install -r requirements.txt -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+
+# deactivate the virtual environment
+# deactivate
 ```
 
 ## 2. 配置文件
@@ -47,8 +50,6 @@ python3 -m DP.document_processor \
   --embedding-model BAAI/bge-small-zh-v1.5
 ```
 
-（`vector_index.batch_size` 仅在配置文件中保留作将来批处理调优，当前 CLI 未暴露。）
-
 ## 4. RAG：生成完整 Prompt（不调用 LLM）
 
 运行 `RAG/rag_api.py` 后，会执行：
@@ -57,18 +58,26 @@ python3 -m DP.document_processor \
 ```bash
 export HF_ENDPOINT=https://hf-mirror.com
 cd /home/ymrobot/ws/ymbot/ASR_LLM_TTS/chat_assistant
-python3 -m RAG.rag_api --query "什么是RAG？"
+```
+
+- 交互模式
+
+```bash
+python3 -m RAG.rag_api
+```
+
+- 单次测试
+
+```bash
+python3 -m RAG.rag_api --query "RAG是什么？"
 python3 -m RAG.rag_api --query "RAG是什么？ --张三"
-python3 -m RAG.rag_api --query "RAG是什么？" --user-id "张三"
+python3 -m RAG.rag_api --query "RAG是什么？"--user-id "张三"
 ```
 
 输出是 JSON，包含：
 
 - `contexts`：重排后的上下文
 - `prompt`：可直接给后续大模型模块使用的完整提示词
-
-> 当前不包含 LLM 通信，也不提供外部服务接口。  
-> 仍会加载 **Embedding**：FAISS 检索需要把问题编码为与建库相同的向量空间；与是否调用大模型无关。
 
 ## 5. 日志
 
@@ -103,14 +112,21 @@ python3 -m RAG.rag_api --query "RAG是什么？" --user-id "张三"
 - `RAG/prompt_builder.py`：Prompt 生成
 - `RAG/rag_api.py`：运行时流程入口（到 Prompt 为止）
 
-from RAG.rag_runtime import RAGService
-self.rag = RAGService()  # 只加载一次
+## 7.接口示例
+ 
+- 初始化
 
-def chat_response(self, user_text: str, user_id: str | None = None) -> str | None:
-    # 可选：通过某种策略判断是否走 RAG，例如关键词或简单规则
-    if self._should_use_rag(user_text):
-        rag_result = self.rag.query(user_text)
-        enhanced_prompt = rag_result["prompt"]
-        # 将 enhanced_prompt 作为新的用户消息，或者替换原有 user_text
-        user_text = enhanced_prompt
-    # ... 后续原有逻辑不变
+```bash
+from RAG.rag_api import RAGService
+
+self.rag_client = RAGService()
+```
+
+- 响应示例
+
+```bash
+rag_result = self.rag_client.query(user_text)
+
+# 传入用户姓名
+rag_result = self.rag_client.query(query=user_text, user_id="张三")
+```
