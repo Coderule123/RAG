@@ -1,7 +1,8 @@
 from typing import Optional
-
+from RAG.config.logger_runtime import get_logger, setup_logging
 from langchain_core.prompts import ChatPromptTemplate
 
+logger = get_logger("rag")
 
 def build_prompt(
     query: str, context: str, vision_user_id: Optional[str] = None, voice_user_id: Optional[str] = None
@@ -18,10 +19,13 @@ def build_prompt(
     # 处理视觉用户姓名
     if vision_user_id is not None and str(vision_user_id).strip():
         user_line += f"当前看到的用户的姓名是：{str(vision_user_id).strip()}\n"
+        logger.info(vision_user_id)
 
     # 处理语音用户 ID
-    if voice_user_id is not None and str(voice_user_id).strip():
-        user_line += f"当前听到的用户的姓名是：{str(voice_user_id).strip()}\n"
+    if vision_user_id is None:
+        if voice_user_id is not None and str(voice_user_id).strip():
+            user_line += f"当前听到的用户的姓名是：{str(voice_user_id).strip()}\n"
+            logger.info(voice_user_id)
 
     # 保留原结尾的双换行（可根据实际需要调整）
     if user_line:   # 只有在至少添加了一行内容时才追加换行
@@ -38,7 +42,7 @@ def build_prompt(
         "【问题】\n"
         "{question}\n"
         "\n"
-        "请输出回答（末尾必须包含 <INTENT>状态</INTENT>）："
+        "请输出回答,并一定要附带上用户的姓名（末尾必须包含 <INTENT>状态</INTENT>）："
     )
     prompt = ChatPromptTemplate.from_template(template)
     return prompt.format(user_line=user_line, context=context, question=query)
