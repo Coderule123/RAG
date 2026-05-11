@@ -155,7 +155,8 @@ class RAGService:
         query: str,
         top_k: Optional[int] = None,
         rerank_top_n: Optional[int] = None,
-        user_id: Optional[str] = None,
+        vision_user_id: Optional[str] = None,
+        vioce_user_id: Optional[str] = None,
         verbose: bool = True,
     ) -> Dict[str, Any]:
         """执行完整的 RAG 流程：检索 → 重排 → 构建上下文 → 生成 Prompt。"""
@@ -193,7 +194,7 @@ class RAGService:
         # 构建上下文和 Prompt
         t2 = time.perf_counter()
         context = build_context(reranked, vector_threshold=vector_threshold)
-        prompt = build_prompt(query, context, user_id=user_id)
+        prompt = build_prompt(query, context, vision_user_id=vision_user_id, vioce_user_id=vioce_user_id)
         timings["build_context_prompt"] = time.perf_counter() - t2
         timings["total"] = (
             timings["retrieve"] + timings["rerank"] + timings["build_context_prompt"]

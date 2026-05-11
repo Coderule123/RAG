@@ -4,7 +4,7 @@ from langchain_core.prompts import ChatPromptTemplate
 
 
 def build_prompt(
-    query: str, context: str, user_id: Optional[str] = None
+    query: str, context: str, vision_user_id: Optional[str] = None, vioce_user_id: Optional[str] = None
 ) -> str:
     """
     组装 RAG 提示词字符串，融合状态判断指令。
@@ -14,8 +14,18 @@ def build_prompt(
     3. 状态可选值：CUSTOMER_ENTER, NEEDS_GUIDANCE, MOVE_TO_WAIT, WAIT_FOR_TALK（默认）。
     """
     user_line = ""
-    if user_id is not None and str(user_id).strip():
-        user_line = f"当前用户的姓名是：{str(user_id).strip()}\n\n"
+
+    # 处理视觉用户姓名
+    if vision_user_id is not None and str(vision_user_id).strip():
+        user_line += f"当前看到的用户的姓名是：{str(vision_user_id).strip()}\n"
+
+    # 处理语音用户 ID
+    if vioce_user_id is not None and str(vioce_user_id).strip():
+        user_line += f"当前听到的用户的姓名是：{str(vioce_user_id).strip()}\n"
+
+    # 保留原结尾的双换行（可根据实际需要调整）
+    if user_line:   # 只有在至少添加了一行内容时才追加换行
+        user_line += "\n"
 
     template = (
         "你是一个智能导购助手。请严格遵循以下要求：\n"
