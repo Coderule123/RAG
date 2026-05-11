@@ -4,7 +4,7 @@ from langchain_core.prompts import ChatPromptTemplate
 
 
 def build_prompt(
-    query: str, context: str, vision_user_id: Optional[str] = None, vioce_user_id: Optional[str] = None
+    query: str, context: str, vision_user_id: Optional[str] = None, voice_user_id: Optional[str] = None
 ) -> str:
     """
     组装 RAG 提示词字符串，融合状态判断指令。
@@ -20,8 +20,8 @@ def build_prompt(
         user_line += f"当前看到的用户的姓名是：{str(vision_user_id).strip()}\n"
 
     # 处理语音用户 ID
-    if vioce_user_id is not None and str(vioce_user_id).strip():
-        user_line += f"当前听到的用户的姓名是：{str(vioce_user_id).strip()}\n"
+    if voice_user_id is not None and str(voice_user_id).strip():
+        user_line += f"当前听到的用户的姓名是：{str(voice_user_id).strip()}\n"
 
     # 保留原结尾的双换行（可根据实际需要调整）
     if user_line:   # 只有在至少添加了一行内容时才追加换行

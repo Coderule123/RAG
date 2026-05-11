@@ -127,6 +127,9 @@ self.rag_client = RAGService()
 ```bash
 rag_result = self.rag_client.query(user_text)
 
-# 传入用户姓名
+# 传入视觉姓名
 rag_result = self.rag_client.query(query=user_text, user_id="张三")
+
+# 传入声纹姓名
+rag_result = self.rag_client.query(query=user_text, vision_user_id=vision_user_id, voice_user_id=voice_user_id)
 ```
