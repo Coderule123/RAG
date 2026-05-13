@@ -4,7 +4,7 @@ import re
 import sqlite3
 from collections import defaultdict
 from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
@@ -133,11 +133,11 @@ class VectorStore:
         """
         name = Path(source).name.strip() or "unknown"
         peers = basename_groups.get(name, [])
+        stem = Path(name).stem
         if len(peers) <= 1:
-            return name
-        stem, suf = Path(name).stem, Path(name).suffix
+            return f"{stem}.json" if stem else "unknown.json"
         short = hashlib.sha256(source.encode("utf-8")).hexdigest()[:8]
-        return f"{stem}__{short}{suf}" if stem else f"{short}{suf}"
+        return f"{stem}__{short}.json" if stem else f"{short}.json"
 
     def _persist_doc_hash_and_split_metadata(self, all_meta: List[Dict]) -> None:
         """
@@ -231,6 +231,198 @@ class VectorStore:
                     ],
                 )
             conn.commit()
+
+    def _wipe_faiss_persistence(self) -> None:
+        """删除已持久化的 faiss / pkl，用于向量库被删空后的状态。"""
+        if not self.faiss_dir.is_dir():
+            return
+        for suffix in (".faiss", ".pkl"):
+            p = self.faiss_dir / f"{self._FAISS_INDEX_NAME}{suffix}"
+            p.unlink(missing_ok=True)
+
+    def _rebuild_sqlite_from_store(self, store) -> None:
+        """用当前 docstore 全量覆盖 chunks 表，与 FAISS 文档一致。"""
+        rows: List[Tuple] = []
+        for _, doc in self._iter_docstore(store):
+            m = doc.metadata
+            rows.append(
+                (
+                    m.get("source", ""),
+                    str(m.get("page", "")),
+                    int(m.get("chunk_id", -1)),
+                    doc.page_content,
+                    json.dumps(dict(m), ensure_ascii=False),
+                )
+            )
+        with sqlite3.connect(self.sqlite_path) as conn:
+            conn.execute("DELETE FROM chunks")
+            if rows:
+                conn.executemany(
+                    """
+                    INSERT INTO chunks (source, page, chunk_id, text, metadata_json)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    rows,
+                )
+            conn.commit()
+
+    def _sources_matching_metadata_filename(self, store, metadata_filename: str) -> List[str]:
+        """根据 metadata/ 下导出的 JSON 文件名，反查当前索引中的 source 列表。"""
+        name = (metadata_filename or "").strip()
+        if not name:
+            return []
+        if not name.endswith(".json"):
+            name = f"{name}.json"
+
+        sources_raw = sorted(
+            {
+                normalize_source_key(d.metadata.get("source", ""))
+                for _, d in self._iter_docstore(store)
+                if d.metadata.get("source")
+            }
+        )
+        basename_groups: Dict[str, List[str]] = defaultdict(list)
+        for src in sources_raw:
+            basename_groups[Path(src).name].append(src)
+
+        matched: List[str] = []
+        for src in sources_raw:
+            fname = self._metadata_basename_for_source(src, basename_groups)
+            if fname == name:
+                matched.append(src)
+        return matched
+
+    def _ensure_delete_supported(self, store) -> None:
+        if not hasattr(store, "delete"):
+            raise RuntimeError("当前 LangChain FAISS 版本不支持 delete，无法按条件删除")
+
+    def delete_by_metadata_selector(
+        self,
+        embeddings_model,
+        *,
+        source: Optional[str] = None,
+        metadata_json: Optional[str] = None,
+        delete_all: bool = False,
+        doc_ids: Optional[List[int]] = None,
+        chunk_id: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        按「原始文档路径 source」或「index_store/metadata/ 下 JSON 文件名」定位，
+        删除 FAISS 中匹配的向量，并重写 metadata/、doc_hash.json、chunks.db。
+
+        doc_id 与入库时 semantic_splitter 写入的一致；可选 chunk_id 缩窄到单条分块。
+        delete_all 为真时删除该来源在库中的全部 chunk；否则须提供 doc_ids。
+        """
+        if not self._faiss_persisted_ready():
+            raise FileNotFoundError(f"未找到可用 FAISS 索引: {self.faiss_dir}")
+
+        meta_key = (metadata_json or "").strip()
+        src_key = (source or "").strip()
+        if bool(meta_key) == bool(src_key):
+            raise ValueError(
+                "请指定且仅指定其一：metadata_json（metadata 目录下文件名，如 car_info.json）"
+                " 或 source（数据文件路径，如 RAG/assets/data/car_info.json）"
+            )
+
+        if not delete_all and (not doc_ids):
+            raise ValueError("非全量删除时必须提供至少一个 doc_id")
+
+        if delete_all and doc_ids:
+            raise ValueError("全量删除与 doc_id 列表互斥")
+
+        store = self._load_store(embeddings_model)
+        self._ensure_delete_supported(store)
+
+        if meta_key:
+            targets = self._sources_matching_metadata_filename(store, meta_key)
+            if not targets:
+                raise ValueError(
+                    f"当前索引中未找到与 metadata 文件 {meta_key!r} 对应的 source（可能未入库或文件名不一致）"
+                )
+            if len(targets) > 1:
+                raise ValueError(
+                    f"metadata 文件名 {meta_key!r} 对应多条 source，请改用 source 显式指定其一: {targets}"
+                )
+        else:
+            targets = [normalize_source_key(src_key)]
+
+        target_norm_set = {normalize_source_key(t) for t in targets}
+
+        doc_id_set: Optional[Set[int]] = None
+        if doc_ids is not None:
+            doc_id_set = {int(x) for x in doc_ids}
+
+        ids_to_delete: List[str] = []
+        for lid, doc in self._iter_docstore(store):
+            doc_src = normalize_source_key(doc.metadata.get("source", ""))
+            if doc_src not in target_norm_set:
+                continue
+            if delete_all:
+                ids_to_delete.append(lid)
+                continue
+            did = doc.metadata.get("doc_id")
+            try:
+                did_int = int(did) if did is not None else None
+            except (TypeError, ValueError):
+                did_int = None
+            if doc_id_set is None or did_int is None or did_int not in doc_id_set:
+                continue
+            if chunk_id is not None:
+                try:
+                    cid = int(doc.metadata.get("chunk_id", -1))
+                except (TypeError, ValueError):
+                    cid = -1
+                if cid != int(chunk_id):
+                    continue
+            ids_to_delete.append(lid)
+
+        if not ids_to_delete:
+            return {
+                "deleted": 0,
+                "matched_sources": targets,
+                "message": "没有匹配的向量可删除（请检查 doc_id、chunk_id 或 source）",
+            }
+
+        store.delete(ids=ids_to_delete)
+        remaining = list(self._iter_docstore(store))
+
+        if not remaining:
+            self._wipe_faiss_persistence()
+            self.doc_hash_path.write_text("{}", encoding="utf-8")
+            self.metadata_docs_dir.mkdir(parents=True, exist_ok=True)
+            for path in self.metadata_docs_dir.iterdir():
+                if path.is_file():
+                    path.unlink(missing_ok=True)
+            with sqlite3.connect(self.sqlite_path) as conn:
+                conn.execute("DELETE FROM chunks")
+                conn.commit()
+            logger.info(
+                "delete_by_metadata_selector: 已删除全部向量 deleted=%s", len(ids_to_delete)
+            )
+            return {
+                "deleted": len(ids_to_delete),
+                "matched_sources": targets,
+                "total_chunks": 0,
+                "index_cleared": True,
+            }
+
+        self.faiss_dir.mkdir(parents=True, exist_ok=True)
+        store.save_local(str(self.faiss_dir))
+        all_meta = self._store_to_metadata(store)
+        self._persist_doc_hash_and_split_metadata(all_meta)
+        self._rebuild_sqlite_from_store(store)
+        logger.info(
+            "delete_by_metadata_selector: deleted=%s remaining_total=%s targets=%s",
+            len(ids_to_delete),
+            len(all_meta),
+            targets,
+        )
+        return {
+            "deleted": len(ids_to_delete),
+            "matched_sources": targets,
+            "total_chunks": len(all_meta),
+            "index_cleared": False,
+        }
 
     def build_or_append(
         self,
