@@ -21,7 +21,7 @@ pip install -r requirements.txt -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web
 统一配置在 `config/config.yaml`，重点参数：
 
 - `paths.data_dir`：知识库目录（默认 `./assets/data`）
-- `paths.index_dir`：向量库目录（默认 `./assets/index_store`）
+- `paths.index_dir`：向量库根目录（默认 `./RAG/assets/index_store`），其下由 DP 自动生成 `faiss_store/`、`metadata/`（按文档文件名的分块元数据 JSON，条目中不含 `source`）、`doc_hash.json`（增量用文件哈希表）、`chunks.db`
 - `paths.models_dir`：模型缓存目录（默认 `./assets/models`）
 - `models.embedding_model`：Embedding 模型
 - `models.reranker_model`：Reranker 模型
@@ -31,7 +31,7 @@ pip install -r requirements.txt -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web
 ## 3. DP：构建向量库
 
 运行 `DP/document_processor.py` 即可完成：
-加载文档 -> 语义切分 -> 向量化 -> 写入 FAISS（LangChain）+ metadata + sqlite。
+加载文档（增量时仅读 `doc_hash.json`）-> 语义切分 -> 向量化 -> 写入 FAISS（LangChain）+ 按文档文件名的 `metadata/*` + `doc_hash.json` + sqlite。
 
 ```bash
 export HF_ENDPOINT=https://hf-mirror.com
@@ -101,7 +101,7 @@ python3 -m RAG.rag_api --query "RAG是什么？"--user-id "张三"
 - `DP/document_loader.py`：文档加载
 - `DP/semantic_splitter.py`：语义切分
 - `DP/embedding_service.py`：Embedding 封装
-- `DP/vector_store.py`：LangChain FAISS 持久化
+- `DP/vector_store.py`：LangChain FAISS 持久化，并维护 `doc_hash.json` 与 `metadata/` 分文件元数据
 - `DP/document_processor.py`：预处理流程入口
 
 ### RAG

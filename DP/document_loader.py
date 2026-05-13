@@ -16,6 +16,63 @@ from RAG.config.logger_runtime import get_logger
 
 logger = get_logger("rag")
 
+# 仓库根目录（含 RAG 包与 assets）：source / doc_hash.json 键统一为相对此根的 POSIX 路径，如 RAG/assets/data/xxx.json
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def canonical_source_path(file_path: Path) -> str:
+    """
+    将数据文件路径规范为相对仓库根的写法（RAG/assets/data/...），与 doc_hash.json 键一致。
+    若文件不在仓库根之下则退回绝对路径（POSIX 字符串）。
+    """
+    abs_p = file_path.resolve()
+    try:
+        rel = abs_p.relative_to(_REPO_ROOT)
+    except ValueError:
+        logger.warning("路径不在仓库根 %s 之下，source 使用绝对路径: %s", _REPO_ROOT, abs_p)
+        return str(abs_p).replace("\\", "/")
+    return str(rel).replace("\\", "/")
+
+
+def normalize_source_key(key: str) -> str:
+    """将 doc_hash.json 等处的 source 键规范为与 canonical_source_path 相同的相对路径（兼容旧版绝对路径）。"""
+    if not key:
+        return key
+    key = key.strip().replace("\\", "/")
+    p = Path(key)
+    if p.is_absolute():
+        try:
+            return str(p.resolve().relative_to(_REPO_ROOT)).replace("\\", "/")
+        except ValueError:
+            return str(p.resolve()).replace("\\", "/")
+    return key.lstrip("./")
+
+
+def alternate_source_keys(key: str) -> set[str]:
+    """
+    返回与同一逻辑文件等价的 source 字符串集合（相对仓库根、绝对路径），
+    用于删除 sqlite 中旧绝对路径行或对齐历史索引。
+    """
+    if not key:
+        return set()
+    raw = str(key).strip().replace("\\", "/")
+    out: set[str] = {raw, normalize_source_key(raw)}
+    p = Path(raw)
+    if p.is_absolute():
+        try:
+            rel = str(p.resolve().relative_to(_REPO_ROOT)).replace("\\", "/")
+            out.add(rel)
+        except ValueError:
+            pass
+    else:
+        try:
+            abs_p = str((_REPO_ROOT / raw).resolve()).replace("\\", "/")
+            out.add(abs_p)
+        except (ValueError, OSError):
+            pass
+    return {k for k in out if k}
+
+
 # 按扩展名选择 Loader；未列出的后缀会被跳过
 LOADER_BY_SUFFIX = {
     ".txt": TextLoader,
@@ -49,39 +106,29 @@ def compute_file_hash(file_path: Path) -> str:
     return sha.hexdigest()
 
 
-def load_hash_registry(metadata_path: Optional[str]) -> Dict[str, str]:
+def load_hash_registry(index_dir: Optional[str]) -> Dict[str, str]:
     """
-    从 metadata.json 提取 source -> doc_hash 映射。
-    metadata 兼容旧格式：若缺失 doc_hash，则该文件下次会被重新处理一次。
+    从 index_store/doc_hash.json 读取 source -> doc_hash，用于增量模式下判断是否需重新加载文件。
+    键统一为相对仓库根的路径（如 RAG/assets/data/...）；若文件不存在或解析失败则返回空字典。
     """
-    if not metadata_path:
+    if not index_dir:
         return {}
 
-    path = Path(metadata_path)
-    if not path.exists():
+    doc_hash_path = Path(index_dir) / "doc_hash.json"
+    if not doc_hash_path.exists():
         return {}
-
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload = json.loads(doc_hash_path.read_text(encoding="utf-8"))
     except Exception as exc:
-        logger.warning("读取 metadata 失败，将忽略增量缓存: %s, err=%s", path, exc)
+        logger.warning("读取 doc_hash.json 失败，将忽略增量缓存: %s, err=%s", doc_hash_path, exc)
         return {}
-
-    if isinstance(payload, dict):
-        records = payload.get("chunks", [])
-    elif isinstance(payload, list):
-        records = payload
-    else:
+    if not isinstance(payload, dict):
         return {}
-
-    registry: Dict[str, str] = {}
-    for item in records:
-        metadata = item.get("metadata", {}) if isinstance(item, dict) else {}
-        source = metadata.get("source")
-        doc_hash = metadata.get("doc_hash")
-        if source and doc_hash:
-            registry[source] = doc_hash
-    return registry
+    return {
+        normalize_source_key(str(k)): str(v)
+        for k, v in payload.items()
+        if k and v
+    }
 
 
 def _compact_fragmented_line(line: str) -> str:
@@ -134,7 +181,7 @@ def load_json_documents(file_path: Path, file_hash: str) -> List[Document]:
     若是问答数组（如 instruction/input/output），则将每个问答对展开成一条独立 Document。
     """
     payload = json.loads(file_path.read_text(encoding="utf-8"))
-    source = str(file_path.resolve())
+    source = canonical_source_path(file_path)
 
     if isinstance(payload, list):
         documents: List[Document] = []
@@ -218,19 +265,19 @@ def load_json_documents(file_path: Path, file_hash: str) -> List[Document]:
 
 
 def load_documents(
-    data_dir: str, incremental: bool = True, metadata_path: Optional[str] = None
+    data_dir: str, incremental: bool = True, index_dir: Optional[str] = None
 ) -> Tuple[List[Document], Dict[str, int]]:
     """
     递归扫描 data_dir 下支持的文件，加载为 LangChain Document 列表。
-    返回 (文档列表, 统计信息)；每条记录补充 source / page / doc_hash 元数据便于追溯。
-    增量模式通过 metadata.json 中已有 chunk 的 doc_hash 判定新增/变更文件。
+    返回 (文档列表, 统计信息)；每条记录补充 source（相对仓库根 RAG/assets/...）/ page / doc_hash 元数据便于追溯。
+    增量模式通过 index_store/doc_hash.json 中的文件哈希判定新增/变更文件。
     """
     logger.info("开始加载文档: %s", data_dir)
     root = Path(data_dir)
     if not root.exists():
         raise FileNotFoundError(f"数据目录不存在: {data_dir}")
 
-    registry = load_hash_registry(metadata_path) if incremental else {}
+    registry = load_hash_registry(index_dir) if incremental else {}
     records: List[Document] = []
     failed_files = 0
     skipped_unchanged = 0
@@ -238,7 +285,7 @@ def load_documents(
         if not file_path.is_file():
             continue
         file_hash = compute_file_hash(file_path)
-        source = str(file_path.resolve())
+        source = canonical_source_path(file_path)
         if incremental and registry.get(source) == file_hash:
             skipped_unchanged += 1
             continue
@@ -260,7 +307,7 @@ def load_documents(
             if not text:
                 continue
             metadata = dict(doc.metadata)
-            metadata["source"] = metadata.get("source", source)
+            metadata["source"] = source
             metadata["page"] = metadata.get(
                 "page", metadata.get("page_number", page_idx)
             )

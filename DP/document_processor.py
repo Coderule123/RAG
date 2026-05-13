@@ -76,11 +76,11 @@ def main() -> None:
         logger.info("CLI 模式运行")
 
     logger.info("开始文档处理流程")
-    metadata_path = str(Path(args.index_dir) / "metadata.json")
+    index_dir = str(Path(args.index_dir).resolve())
     docs, load_stats = load_documents(
         args.data_dir,
         incremental=args.incremental,
-        metadata_path=metadata_path,
+        index_dir=index_dir,
     )
     if not docs:
         result = {
@@ -88,7 +88,9 @@ def main() -> None:
             "chunk_count": 0,
             "total_chunks": 0,
             "message": "没有新增或变更文档",
-            "metadata_path": metadata_path,
+            "index_dir": index_dir,
+            "doc_hash_path": str(Path(index_dir) / "doc_hash.json"),
+            "metadata_docs_dir": str(Path(index_dir) / "metadata"),
             **load_stats,
         }
         logger.info("无新增文档，流程结束")

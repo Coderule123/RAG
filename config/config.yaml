@@ -6,7 +6,8 @@
 # 目录：知识库、向量索引、模型缓存、日志
 paths:
   data_dir: "./RAG/assets/data"                 # 待入库文档根目录（DP 读取）
-  index_dir: "./RAG/assets/index_store"         # 向量库与 metadata/sqlite 根目录
+  # 向量库根目录：内含 faiss_store/、metadata/（按文档文件名的分块元数据）、doc_hash.json、chunks.db
+  index_dir: "./RAG/assets/index_store"
   logs_dir: "./RAG/logs"                        # RAG 运行时脚本日志（RAG/rag_api.py）
   doc_logs_dir: "./RAG/logs/doc"                # 文档预处理日志（DP/document_processor.py）
   models_dir: "./RAG/assets/models"             # HF 模型缓存（与 huggingface 段配合）

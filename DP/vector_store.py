@@ -1,6 +1,8 @@
+import hashlib
 import json
 import re
 import sqlite3
+from collections import defaultdict
 from pathlib import Path
 from typing import Dict, Iterable, List, Tuple
 
@@ -8,6 +10,7 @@ from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 
 from RAG.config.logger_runtime import get_logger
+from RAG.DP.document_loader import alternate_source_keys, normalize_source_key
 
 logger = get_logger("rag")
 
@@ -20,18 +23,28 @@ def normalize_for_dedup(text: str) -> str:
 
 class VectorStore:
     """
-    基于 LangChain FAISS 的向量库，并附带 metadata.json 与 sqlite 分块记录。
+    基于 LangChain FAISS 的向量库，并附带 metadata/ 分文件元数据、doc_hash.json 与 sqlite 分块记录。
     建库与增量追加均须传入与运行时相同的 Embedding 封装（见 DP/embedding_service）。
     """
+
+    # 与 LangChain FAISS.save_local / load_local 默认 index_name 一致
+    _FAISS_INDEX_NAME = "index"
 
     def __init__(self, index_dir: str):
         # 索引根目录：其下 faiss_store/ 为 LangChain 持久化目录
         self.index_dir = Path(index_dir)
         self.index_dir.mkdir(parents=True, exist_ok=True)
         self.faiss_dir = self.index_dir / "faiss_store"
-        self.meta_path = self.index_dir / "metadata.json"
+        self.doc_hash_path = self.index_dir / "doc_hash.json"
+        self.metadata_docs_dir = self.index_dir / "metadata"
         self.sqlite_path = self.index_dir / "chunks.db"
         self._init_sqlite()
+
+    def _faiss_persisted_ready(self) -> bool:
+        """是否存在可加载的 FAISS 持久化文件（目录存在但文件缺失时不视为可增量）。"""
+        faiss_file = self.faiss_dir / f"{self._FAISS_INDEX_NAME}.faiss"
+        pkl_file = self.faiss_dir / f"{self._FAISS_INDEX_NAME}.pkl"
+        return faiss_file.is_file() and pkl_file.is_file()
 
     def _init_sqlite(self) -> None:
         """创建分块明细表，便于审计与排查（不参与向量检索）。"""
@@ -75,9 +88,11 @@ class VectorStore:
         removed_replaced = 0
         removed_duplicates = 0
 
+        incoming_norm = {normalize_source_key(s) for s in incoming_sources if s}
+
         for doc_id, doc in self._iter_docstore(store):
-            source = doc.metadata.get("source", "")
-            if source in incoming_sources:
+            doc_src = doc.metadata.get("source", "")
+            if doc_src and normalize_source_key(doc_src) in incoming_norm:
                 ids_to_delete.append(doc_id)
                 removed_replaced += 1
                 continue
@@ -111,6 +126,64 @@ class VectorStore:
             records.append({"text": doc.page_content, "metadata": dict(doc.metadata)})
         return records
 
+    @staticmethod
+    def _metadata_basename_for_source(source: str, basename_groups: Dict[str, List[str]]) -> str:
+        """
+        以加载文档的文件名（路径 basename）作为 metadata/ 下文件名；同名不同路径时加短哈希区分。
+        """
+        name = Path(source).name.strip() or "unknown"
+        peers = basename_groups.get(name, [])
+        if len(peers) <= 1:
+            return name
+        stem, suf = Path(name).stem, Path(name).suffix
+        short = hashlib.sha256(source.encode("utf-8")).hexdigest()[:8]
+        return f"{stem}__{short}{suf}" if stem else f"{short}{suf}"
+
+    def _persist_doc_hash_and_split_metadata(self, all_meta: List[Dict]) -> None:
+        """
+        写入 doc_hash.json（全量 source -> doc_hash），并在 metadata/ 下按文档拆分 JSON，
+        单文件内容为分块条目列表（仅 text + metadata），metadata 中不含 source、doc_hash；文件名为文档 basename。
+        """
+        doc_hashes: Dict[str, str] = {}
+        by_source: Dict[str, List[Dict]] = defaultdict(list)
+
+        for rec in all_meta:
+            if not isinstance(rec, dict):
+                continue
+            meta = dict(rec.get("metadata") or {})
+            source = meta.get("source", "") or ""
+            if source:
+                source = normalize_source_key(source)
+            doc_hash = meta.get("doc_hash")
+            if source and doc_hash:
+                doc_hashes[source] = doc_hash
+            meta_no_export = {
+                k: v for k, v in meta.items() if k not in ("source", "doc_hash")
+            }
+            row = {"text": rec.get("text", ""), "metadata": meta_no_export}
+            if source:
+                by_source[source].append(row)
+
+        self.doc_hash_path.write_text(
+            json.dumps(doc_hashes, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+
+        self.metadata_docs_dir.mkdir(parents=True, exist_ok=True)
+        for path in self.metadata_docs_dir.iterdir():
+            if path.is_file():
+                path.unlink(missing_ok=True)
+
+        basename_groups: Dict[str, List[str]] = defaultdict(list)
+        for src in by_source:
+            basename_groups[Path(src).name].append(src)
+
+        for source, rows in by_source.items():
+            fname = self._metadata_basename_for_source(source, basename_groups)
+            out_path = self.metadata_docs_dir / fname
+            out_path.write_text(
+                json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+
     def _build_store_in_batches(
         self, chunks: List[Document], embeddings_model, batch_size: int
     ):
@@ -128,14 +201,17 @@ class VectorStore:
         self, sources: set, chunks: List[Document], incremental: bool
     ) -> None:
         """移除被替换来源的旧明细，再写入本次新增 chunk。"""
+        expanded: set[str] = set()
+        for s in sources:
+            expanded.update(alternate_source_keys(s))
         with sqlite3.connect(self.sqlite_path) as conn:
             if not incremental:
                 conn.execute("DELETE FROM chunks")
-            elif sources:
-                placeholders = ",".join("?" for _ in sources)
+            elif expanded:
+                placeholders = ",".join("?" for _ in expanded)
                 conn.execute(
                     f"DELETE FROM chunks WHERE source IN ({placeholders})",
-                    tuple(sources),
+                    tuple(expanded),
                 )
             if chunks:
                 conn.executemany(
@@ -177,16 +253,24 @@ class VectorStore:
             raise ValueError("没有可写入向量库的 chunk")
 
         incoming_sources = {
-            chunk.metadata.get("source", "")
+            normalize_source_key(s)
             for chunk in chunks
-            if chunk.metadata.get("source", "")
+            if (s := chunk.metadata.get("source", ""))
         }
         removed_stats = {
             "removed_replaced": 0,
             "removed_duplicates": 0,
         }
 
-        if incremental and self.faiss_dir.exists():
+        use_incremental_append = incremental and self._faiss_persisted_ready()
+        if incremental and not self._faiss_persisted_ready():
+            logger.info(
+                "增量模式已开启但未找到完整 FAISS 文件 (%s.faiss / .pkl)，按首次建库处理: %s",
+                self._FAISS_INDEX_NAME,
+                self.faiss_dir,
+            )
+
+        if use_incremental_append:
             vs = self._load_store(embeddings_model)
             removed_stats = self._prune_existing(vs, incoming_sources)
             for i in range(0, len(chunks), batch_size):
@@ -195,12 +279,11 @@ class VectorStore:
         else:
             vs = self._build_store_in_batches(chunks, embeddings_model, batch_size)
 
+        self.faiss_dir.mkdir(parents=True, exist_ok=True)
         vs.save_local(str(self.faiss_dir))
         all_meta = self._store_to_metadata(vs)
-        self.meta_path.write_text(
-            json.dumps(all_meta, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        self._replace_sqlite_rows(incoming_sources, chunks, incremental)
+        self._persist_doc_hash_and_split_metadata(all_meta)
+        self._replace_sqlite_rows(incoming_sources, chunks, use_incremental_append)
         logger.info(
             "向量库写入完成: total=%s removed_replaced=%s removed_duplicates=%s",
             len(all_meta),
@@ -211,6 +294,7 @@ class VectorStore:
             "added_chunks": len(chunks),
             "total_chunks": len(all_meta),
             "faiss_dir": str(self.faiss_dir),
-            "metadata_path": str(self.meta_path),
+            "doc_hash_path": str(self.doc_hash_path),
+            "metadata_docs_dir": str(self.metadata_docs_dir),
             **removed_stats,
         }
