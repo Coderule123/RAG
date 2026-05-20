@@ -1,0 +1,19 @@
+# --- LangChain 核心与社区集成 ---
+langchain-core
+langchain-community
+langchain-text-splitters
+langchain-huggingface
+
+# --- 向量库 ---
+faiss-cpu
+
+# --- 本地 Embedding / Rerank（HuggingFaceEmbeddings、CrossEncoder）---
+sentence-transformers
+
+# --- 文档解析 ---
+numpy
+pypdf
+docx2txt
+
+# --- 配置 ---
+pyyaml

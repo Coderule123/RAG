@@ -22,7 +22,11 @@ from RAG.config.logger_runtime import get_logger, setup_logging
 from RAG.DP.embedding_service import EmbeddingService
 
 from .context_builder import build_context
-from .prompt_builder import build_prompt
+from .prompt_builder import (
+    build_prompt,
+    extract_visit_location,
+    resolve_display_name,
+)
 from .reranker_service import RerankerService
 from .retriever_runtime import RetrieverRuntime
 
@@ -194,7 +198,16 @@ class RAGService:
         # 构建上下文和 Prompt
         t2 = time.perf_counter()
         context = build_context(reranked, vector_threshold=vector_threshold)
-        prompt = build_prompt(query, context, vision_user_id=vision_user_id, voice_user_id=voice_user_id)
+        visit_locations = self.config.get("visit_locations")
+        display_user_id, is_person_name, _ = resolve_display_name(vision_user_id)
+        detected_location = extract_visit_location(query, visit_locations)
+        prompt = build_prompt(
+            query,
+            context,
+            vision_user_id=vision_user_id,
+            voice_user_id=voice_user_id,
+            visit_locations=visit_locations,
+        )
         timings["build_context_prompt"] = time.perf_counter() - t2
         timings["total"] = (
             timings["retrieve"] + timings["rerank"] + timings["build_context_prompt"]
@@ -207,6 +220,11 @@ class RAGService:
             "context": context,
             "prompt": prompt,
             "timings": timings,
+            "prompt_meta": {
+                "display_user_id": display_user_id,
+                "is_person_name": is_person_name,
+                "detected_location": detected_location,
+            },
         }
         if verbose:
             self._print_result(result)
@@ -294,7 +312,7 @@ def interactive_mode(rag_service: RAGService, top_k: int, rerank_top_n: int) -> 
                 question,
                 top_k=top_k,
                 rerank_top_n=rerank_top_n,
-                user_id=inline_user_id,
+                vision_user_id=inline_user_id,
             )
         except Exception as e:
             print(f"处理问题时出错: {e}")
@@ -331,7 +349,7 @@ def main() -> None:
             query=question,
             top_k=args.top_k,
             rerank_top_n=args.rerank_top_n,
-            user_id=user_id,
+            vision_user_id=user_id,
         )
         logger.info("完成一次 RAG 服务流程")
     else:
