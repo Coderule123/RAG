@@ -3,11 +3,27 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
+MAX_LOG_FILES = 50
+
+
+def _cleanup_old_logs(log_dir: Path, keep: int = MAX_LOG_FILES) -> None:
+    """仅保留最新的 keep 个 .log 文件，其余按修改时间倒序删除。"""
+    try:
+        files = sorted(log_dir.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True)
+        for stale in files[keep:]:
+            try:
+                stale.unlink()
+            except OSError:
+                pass
+    except OSError:
+        pass
+
 
 def setup_logging(log_dir: str, logger_name: str = "rag") -> str:
     """
     为指定 logger 配置双输出；返回本次运行日志文件路径。
     重复调用会清空该 logger 已有 handler，避免重复打印。
+    仅保留最近 MAX_LOG_FILES 个日志文件，更早的会被清理。
     """
     path = Path(log_dir)
     path.mkdir(parents=True, exist_ok=True)
@@ -29,6 +45,8 @@ def setup_logging(log_dir: str, logger_name: str = "rag") -> str:
 
     logger.addHandler(console)
     logger.addHandler(file_handler)
+
+    _cleanup_old_logs(path)
     return str(run_file)
 
 

@@ -28,6 +28,50 @@ VISIT_INTENT_KEYWORDS: Tuple[str, ...] = (
     "逛逛展厅",
 )
 
+def is_visit_intent_query(query: str) -> bool:
+    """判断用户问题是否体现参观/游览意向。"""
+    q = (query or "").strip()
+    if not q:
+        return False
+    return any(kw in q for kw in VISIT_INTENT_KEYWORDS)
+
+
+def extract_visit_location(query: str,locations: Optional[List[str]] = None,) -> Optional[str]:
+    """
+    从问题中提取可导航地点。
+    仅当问题包含参观意向且命中已知地点列表时返回地点（多个则逗号拼接）。
+    """
+    if not is_visit_intent_query(query):
+        return None
+    locs = locations if locations is not None else DEFAULT_VISIT_LOCATIONS
+    matched = [loc for loc in locs if loc and loc in query]
+    if not matched:
+        return None
+    return ",".join(matched)
+
+def _build_intent_instruction_lines(query: str,locations: Optional[List[str]] = None,) -> Tuple[str, Optional[str]]:
+    """
+    生成意图与地点相关的输出格式说明。
+    返回 (instruction_text, detected_location)。
+    """
+    detected_location = extract_visit_location(query, locations)
+
+    intent_rules = ""
+
+    if detected_location:
+        intent_rules += (
+            f"【参观意向】用户问题已提到地点：{detected_location}。\n"
+            f"如果状态为 <INTENT>NEEDS_GUIDANCE</INTENT> 则之后紧跟 <LOCATION>{detected_location}</LOCATION>，"
+            "并在正文中简要说明将引导对方前往该地点。\n"
+        )
+    elif is_visit_intent_query(query):
+        intent_rules += (
+            "【参观意向】\n用户问题体现参观/游览意向，但未指明具体地点（"
+            + "、".join(locations or DEFAULT_VISIT_LOCATIONS)
+            + "）。可主动询问想参观哪个区域，暂不输出 <LOCATION> 标签。\n"
+        )
+
+    return intent_rules, detected_location
 
 def is_timestamp_user_id(user_id: str) -> bool:
     """判断是否为匿名访客时间戳标识（年_月_日_分_秒）。"""
@@ -49,9 +93,7 @@ def is_concrete_person_name(user_id: Optional[str]) -> bool:
     return bool(re.search(r"[\u4e00-\u9fff]", raw))
 
 
-def resolve_display_name(
-    vision_user_id: Optional[str] = None,
-) -> Tuple[Optional[str], bool, Optional[str]]:
+def resolve_display_name(vision_user_id: Optional[str] = None,) -> Tuple[Optional[str], bool, Optional[str]]:
     """
     解析用于提示词展示的用户标识。
     返回 (标识字符串, 是否为具体人名, 识别来源说明)。
@@ -69,114 +111,76 @@ def resolve_display_name(
         return uid, False, source
     return None, False, None
 
-
-def is_visit_intent_query(query: str) -> bool:
-    """判断用户问题是否体现参观/游览意向。"""
-    q = (query or "").strip()
-    if not q:
-        return False
-    return any(kw in q for kw in VISIT_INTENT_KEYWORDS)
-
-
-def extract_visit_location(
-    query: str,
-    locations: Optional[List[str]] = None,
-) -> Optional[str]:
-    """
-    从问题中提取可导航地点。
-    仅当问题包含参观意向且命中已知地点列表时返回地点（多个则逗号拼接）。
-    """
-    if not is_visit_intent_query(query):
-        return None
-    locs = locations if locations is not None else DEFAULT_VISIT_LOCATIONS
-    matched = [loc for loc in locs if loc and loc in query]
-    if not matched:
-        return None
-    return ",".join(matched)
-
-
 def _build_user_context_lines(
     vision_user_id: Optional[str],
+    should_ask_name: bool,
+    resolved_name: Optional[str],
 ) -> str:
-    """根据是否识别到具体人名，生成用户身份相关提示行。"""
+    """根据姓名状态生成访客身份相关提示行。"""
     display_id, is_name, source = resolve_display_name(vision_user_id)
-    if not display_id:
-        return (
-            "【访客身份】当前尚未识别面前来访者的姓名。\n"
-            "请在回答中自然、礼貌地询问对方如何称呼（例如「请问怎么称呼您？」），"
-            "不要编造或假设对方姓名。\n"
-        )
+    final_name = (resolved_name or "").strip()
 
-    if is_name:
-        logger.info("已识别具体人名 (%s): %s", source, display_id)
+    if not final_name and is_name and display_id:
+        final_name = display_id
+
+    if final_name:
+        logger.info("已识别具体人名 (%s): %s", source or "状态提取", final_name)
         return (
-            f"【访客身份】当前{source}到的用户姓名是：{display_id}。\n"
-            f"请在回答中适时、礼貌地使用对方姓名（如「{display_id}」），语气亲切自然；"
+            "【访客身份】\n"
+            f"当前已知用户姓名是：{final_name}。请在回答中适时、礼貌地使用对方姓名（如「{final_name}」），语气亲切自然；"
             "不必每句话都重复姓名，避免生硬。\n"
         )
 
-    logger.info("访客标识非具体人名（时间戳/匿名）: %s", display_id)
+    if should_ask_name:
+        if display_id:
+            logger.info("访客标识首次询问姓名: %s", display_id)
+        return (
+            "【访客身份】\n"
+            "当前仅识别到访客标识，尚未获知对方真实姓名。请在回答中自然、礼貌地询问面前的人如何称呼；"
+            "不要编造或假设姓名，也不要使用访客编号、时间戳或匿名 ID 来称呼对方。\n"
+        )
+
+    if display_id:
+        logger.info("访客已询问过姓名但仍未知，不再追问: %s", display_id)
     return (
-        "【访客身份】当前仅识别到匿名访客标识，尚未获知对方真实姓名。\n"
-        "请在回答中自然、礼貌地询问面前的人如何称呼；"
-        "不要使用访客编号、时间戳或匿名 ID 来称呼对方。\n"
+        "【访客身份】\n"
+        "当前未获得对方姓名。请正常回答问题，不要使用访客编号、时间戳或匿名 ID 来称呼对方，"
+        "也不要再次主动询问姓名。\n"
     )
-
-
-def _build_intent_instruction_lines(
-    query: str,
-    locations: Optional[List[str]] = None,
-) -> Tuple[str, Optional[str]]:
-    """
-    生成意图与地点相关的输出格式说明。
-    返回 (instruction_text, detected_location)。
-    """
-    detected_location = extract_visit_location(query, locations)
-
-    intent_rules = (
-        "- NEEDS_GUIDANCE：需要引导参观、指路、带看展车或展区\n"
-    )
-
-    if detected_location:
-        intent_rules += (
-            f"\n【导航地点】用户问题已提到地点：{detected_location}。\n"
-            f"如果状态为 <INTENT>NEEDS_GUIDANCE</INTENT> 则之后紧跟 <LOCATION>{detected_location}</LOCATION>，"
-            "并在正文中简要说明将引导对方前往该地点。\n"
-        )
-    elif is_visit_intent_query(query):
-        intent_rules += (
-            "\n【参观意向】用户问题体现参观/游览意向，但未指明具体地点（"
-            + "、".join(locations or DEFAULT_VISIT_LOCATIONS)
-            + "）。可主动询问想参观哪个区域，暂不输出 <LOCATION> 标签。\n"
-        )
-
-    return intent_rules, detected_location
-
 
 def build_prompt(
     query: str,
     context: str,
     vision_user_id: Optional[str] = None,
+    voice_user_id: Optional[str] = None,
     visit_locations: Optional[List[str]] = None,
+    should_ask_name: bool = False,
+    resolved_name: Optional[str] = None,
 ) -> str:
     """
     组装 RAG 提示词字符串，融合访客身份、意图状态与导航地点指令。
 
     要求模型：
     1. 基于【资料】回答问题，资料不足则说明“资料不足”。
-    2. 根据 vision_user_id / voice_user_id 判断是否为人名，调整称呼策略。
+    2. 仅根据 vision_user_id 与状态参数调整称呼策略（voice_user_id 暂不处理）。
     3. 根据用户问题判断意图状态，并在回答末尾附加 <INTENT>状态</INTENT>。
     4. 参观意向且含具体地点时，在 <INTENT> 后附加 <LOCATION>地点</LOCATION>。
     """
-    user_line = _build_user_context_lines(vision_user_id)
+    user_line = _build_user_context_lines(
+        vision_user_id=vision_user_id,
+        should_ask_name=should_ask_name,
+        resolved_name=resolved_name,
+    )
     intent_line, detected_location = _build_intent_instruction_lines(query, visit_locations)
     if detected_location:
         logger.info("参观意向已识别地点: %s", detected_location)
 
     _, is_name, _ = resolve_display_name(vision_user_id)
+    has_name = bool((resolved_name or "").strip()) or is_name
     closing = (
         "请基于【资料】输出完整回答。"
-        + ("回答中请礼貌、恰当地使用对方姓名。" if is_name else "")
+        + ("回答中请礼貌、恰当地使用对方姓名。" if has_name else "")
+        + ("并在回答中自然询问对方姓名。" if should_ask_name else "")
         + "并按照【意图状态】要求输出 <INTENT> 标签"
         + ("及 <LOCATION> 标签（如适用）" if detected_location else "")
         + "："
@@ -186,8 +190,8 @@ def build_prompt(
         "你是一个智能导购助手。请严格遵循以下要求：\n"
         "基于【资料】回答问题。如果资料不足以回答问题，请明确回复“抱歉，我无法回答你的问题”。\n"
         "\n"
-        "{user_line}"
-        "{intent_line}"
+        "{user_line}\n"
+        "{intent_line}\n"
         "【资料】\n"
         "{context}\n"
         "\n"

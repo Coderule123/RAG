@@ -25,10 +25,12 @@ from .context_builder import build_context
 from .prompt_builder import (
     build_prompt,
     extract_visit_location,
+    is_concrete_person_name,
     resolve_display_name,
 )
 from .reranker_service import RerankerService
 from .retriever_runtime import RetrieverRuntime
+from .visitor_state import VisitorStateStore, extract_name_from_query
 
 CURRENT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = CURRENT_DIR.parent
@@ -90,6 +92,9 @@ class RAGService:
 
         hf_runtime = setup_huggingface_env(self.config)
         print("RAGService HF 运行配置: ", hf_runtime)
+
+        state_file = paths.get("visitor_state_file", "./RAG/assets/visitor_state.json")
+        self.visitor_state = VisitorStateStore(state_file)
 
         # 读取重排开关
         retrieval_cfg = self.config.get("retrieval", {})
@@ -199,6 +204,30 @@ class RAGService:
         t2 = time.perf_counter()
         context = build_context(reranked, vector_threshold=vector_threshold)
         visit_locations = self.config.get("visit_locations")
+        vid = (vision_user_id or "").strip() or None
+        should_ask_name = False
+        resolved_name = None
+        visitor_state = None
+
+        if vid and not is_concrete_person_name(vid):
+            state = self.visitor_state.get(vid)
+            if state is None:
+                should_ask_name = True
+                self.visitor_state.mark_asked(vid)
+                state = self.visitor_state.get(vid)
+            else:
+                if state.get("pending_extract"):
+                    extracted_name = extract_name_from_query(query)
+                    if extracted_name:
+                        self.visitor_state.set_name(vid, extracted_name)
+                    else:
+                        self.visitor_state.clear_pending(vid)
+                    state = self.visitor_state.get(vid)
+                resolved_name = state.get("name") if state else None
+            visitor_state = state
+        elif vid and is_concrete_person_name(vid):
+            resolved_name = vid
+
         display_user_id, is_person_name, _ = resolve_display_name(vision_user_id)
         detected_location = extract_visit_location(query, visit_locations)
         prompt = build_prompt(
@@ -207,6 +236,8 @@ class RAGService:
             vision_user_id=vision_user_id,
             voice_user_id=voice_user_id,
             visit_locations=visit_locations,
+            should_ask_name=should_ask_name,
+            resolved_name=resolved_name,
         )
         timings["build_context_prompt"] = time.perf_counter() - t2
         timings["total"] = (
@@ -224,6 +255,9 @@ class RAGService:
                 "display_user_id": display_user_id,
                 "is_person_name": is_person_name,
                 "detected_location": detected_location,
+                "should_ask_name": should_ask_name,
+                "resolved_name": resolved_name,
+                "visitor_state": visitor_state,
             },
         }
         if verbose:
