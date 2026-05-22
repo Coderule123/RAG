@@ -26,11 +26,10 @@ from .prompt_builder import (
     build_prompt,
     extract_visit_location,
     is_concrete_person_name,
-    resolve_display_name,
 )
 from .reranker_service import RerankerService
 from .retriever_runtime import RetrieverRuntime
-from .visitor_state import VisitorStateStore, extract_name_from_query
+from .visitor_state import VisitorStateStore
 
 CURRENT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = CURRENT_DIR.parent
@@ -71,7 +70,6 @@ logger.info("rag_runtime 启动: log_file=%s", LOG_FILE)
 HF_RUNTIME = setup_huggingface_env(CONFIG)
 logger.info("HF 运行配置: %s", json.dumps(HF_RUNTIME, ensure_ascii=False))
 
-
 class RAGService:
     """RAG 服务封装：初始化一次，可多次调用 query() 进行检索与提示词生成。"""
 
@@ -95,6 +93,9 @@ class RAGService:
 
         state_file = paths.get("visitor_state_file", "./RAG/assets/visitor_state.json")
         self.visitor_state = VisitorStateStore(state_file)
+
+        # 每个实例维护自己的 second 标志，初始化为 False
+        self.second = False
 
         # 读取重排开关
         retrieval_cfg = self.config.get("retrieval", {})
@@ -167,6 +168,7 @@ class RAGService:
         vision_user_id: Optional[str] = None,
         voice_user_id: Optional[str] = None,
         verbose: bool = True,
+        is_obtain_name: bool = False,
     ) -> Dict[str, Any]:
         """执行完整的 RAG 流程：检索 → 重排 → 构建上下文 → 生成 Prompt。"""
         if not query or not query.strip():
@@ -182,6 +184,10 @@ class RAGService:
             if rerank_top_n is not None
             else int(retrieval_cfg.get("rerank_top_n", 4))
         )
+
+        # 如果调用方明确要求这是提取姓名的请求，重置实例级 second 为 False
+        if is_obtain_name:
+            self.second = False
 
         timings = {}
 
@@ -206,30 +212,24 @@ class RAGService:
         visit_locations = self.config.get("visit_locations")
         vid = (vision_user_id or "").strip() or None
         should_ask_name = False
-        resolved_name = None
-        visitor_state = None
 
-        if vid and not is_concrete_person_name(vid):
-            state = self.visitor_state.get(vid)
-            if state is None:
-                should_ask_name = True
-                self.visitor_state.mark_asked(vid)
+        # 新传入的数字 id（非人名）且尚无状态 -> 需要询问姓名一次
+        if vid:
+            if not is_concrete_person_name(vid):
+                # 数字 id / 匿名 id 路径：查询状态文件
                 state = self.visitor_state.get(vid)
+                if state is None:
+                    # 新 id：需要询问姓名一次，并记录到状态文件
+                    should_ask_name = True
+                    self.second = True
+                    self.visitor_state.mark_asked(vid)
+                else:
+                    # 旧 id：已询问过或存在记录，不再询问
+                    should_ask_name = False
             else:
-                if state.get("pending_extract"):
-                    extracted_name = extract_name_from_query(query)
-                    if extracted_name:
-                        self.visitor_state.set_name(vid, extracted_name)
-                    else:
-                        self.visitor_state.clear_pending(vid)
-                    state = self.visitor_state.get(vid)
-                resolved_name = state.get("name") if state else None
-            visitor_state = state
-        elif vid and is_concrete_person_name(vid):
-            resolved_name = vid
+                # 传入的是人名，直接传递给 prompt，状态文件不处理
+                should_ask_name = False
 
-        display_user_id, is_person_name, _ = resolve_display_name(vision_user_id)
-        detected_location = extract_visit_location(query, visit_locations)
         prompt = build_prompt(
             query,
             context,
@@ -237,7 +237,7 @@ class RAGService:
             voice_user_id=voice_user_id,
             visit_locations=visit_locations,
             should_ask_name=should_ask_name,
-            resolved_name=resolved_name,
+            is_obtain_name=is_obtain_name,
         )
         timings["build_context_prompt"] = time.perf_counter() - t2
         timings["total"] = (
@@ -251,14 +251,7 @@ class RAGService:
             "context": context,
             "prompt": prompt,
             "timings": timings,
-            "prompt_meta": {
-                "display_user_id": display_user_id,
-                "is_person_name": is_person_name,
-                "detected_location": detected_location,
-                "should_ask_name": should_ask_name,
-                "resolved_name": resolved_name,
-                "visitor_state": visitor_state,
-            },
+            "second": self.second,
         }
         if verbose:
             self._print_result(result)

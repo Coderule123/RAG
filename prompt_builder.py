@@ -92,39 +92,23 @@ def is_concrete_person_name(user_id: Optional[str]) -> bool:
         return False
     return bool(re.search(r"[\u4e00-\u9fff]", raw))
 
-
-def resolve_display_name(vision_user_id: Optional[str] = None,) -> Tuple[Optional[str], bool, Optional[str]]:
-    """
-    解析用于提示词展示的用户标识。
-    返回 (标识字符串, 是否为具体人名, 识别来源说明)。
-    """
-    candidates: List[Tuple[str, str]] = []
-    if vision_user_id is not None and str(vision_user_id).strip():
-        candidates.append(("视觉识别", str(vision_user_id).strip()))
-
-    for source, uid in candidates:
-        if is_concrete_person_name(uid):
-            return uid, True, source
-
-    if candidates:
-        source, uid = candidates[0]
-        return uid, False, source
-    return None, False, None
-
 def _build_user_context_lines(
     vision_user_id: Optional[str],
     should_ask_name: bool,
-    resolved_name: Optional[str],
 ) -> str:
-    """根据姓名状态生成访客身份相关提示行。"""
-    display_id, is_name, source = resolve_display_name(vision_user_id)
-    final_name = (resolved_name or "").strip()
+    """根据传入的 vision_user_id 推断访客身份并生成提示行。
 
-    if not final_name and is_name and display_id:
-        final_name = display_id
+    仅使用传入的 `vision_user_id` 作为识别来源：
+    - 如果该 id 包含中文字符且非时间戳，视为人名；
+    - 否则视为访客标识（如时间戳或编号）。
+    """
+    display_id = str(vision_user_id).strip() if vision_user_id is not None and str(vision_user_id).strip() else None
+    is_name = is_concrete_person_name(vision_user_id)
+    source = "视觉识别" if display_id else None
+    final_name = display_id if is_name and display_id else ""
 
     if final_name:
-        logger.info("已识别具体人名 (%s): %s", source or "状态提取", final_name)
+        logger.info("已识别具体人名 (%s): %s", source or "视觉识别", final_name)
         return (
             "【访客身份】\n"
             f"当前已知用户姓名是：{final_name}。请在回答中适时、礼貌地使用对方姓名（如「{final_name}」），语气亲切自然；"
@@ -155,7 +139,7 @@ def build_prompt(
     voice_user_id: Optional[str] = None,
     visit_locations: Optional[List[str]] = None,
     should_ask_name: bool = False,
-    resolved_name: Optional[str] = None,
+    is_obtain_name: bool = False,
 ) -> str:
     """
     组装 RAG 提示词字符串，融合访客身份、意图状态与导航地点指令。
@@ -166,21 +150,26 @@ def build_prompt(
     3. 根据用户问题判断意图状态，并在回答末尾附加 <INTENT>状态</INTENT>。
     4. 参观意向且含具体地点时，在 <INTENT> 后附加 <LOCATION>地点</LOCATION>。
     """
+    # 如果 caller 明确要求这是一个“提取姓名”的 prompt，构建专用的提取姓名提示语并返回。
+    if is_obtain_name:
+        # 针对 LLM 的姓名抽取提示，要求仅返回姓名（中文），无法确定则返回空字符串。
+        template = (
+            "你是一个助手。请从下面的用户回复中提取用户的真实中文姓名（仅姓名，不要其他说明）。"
+            "如果无法确定真实姓名，请返回空字符串。\n\n用户回复：\n{question}\n"
+        )
+        prompt = ChatPromptTemplate.from_template(template)
+        return prompt.format(question=query)
+
     user_line = _build_user_context_lines(
         vision_user_id=vision_user_id,
         should_ask_name=should_ask_name,
-        resolved_name=resolved_name,
     )
     intent_line, detected_location = _build_intent_instruction_lines(query, visit_locations)
     if detected_location:
         logger.info("参观意向已识别地点: %s", detected_location)
 
-    _, is_name, _ = resolve_display_name(vision_user_id)
-    has_name = bool((resolved_name or "").strip()) or is_name
     closing = (
         "请基于【资料】输出完整回答。"
-        + ("回答中请礼貌、恰当地使用对方姓名。" if has_name else "")
-        + ("并在回答中自然询问对方姓名。" if should_ask_name else "")
         + "并按照【意图状态】要求输出 <INTENT> 标签"
         + ("及 <LOCATION> 标签（如适用）" if detected_location else "")
         + "："
