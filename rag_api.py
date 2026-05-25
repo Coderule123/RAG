@@ -96,6 +96,7 @@ class RAGService:
 
         # 每个实例维护自己的 second 标志，初始化为 False
         self.second = False
+        self.second_ask = False
 
         # 读取重排开关
         retrieval_cfg = self.config.get("retrieval", {})
@@ -187,7 +188,10 @@ class RAGService:
 
         # 如果调用方明确要求这是提取姓名的请求，重置实例级 second 为 False
         if is_obtain_name:
-            self.second = False
+            self.second_ask = False
+
+        if self.second_ask:
+            self.second = True
 
         timings = {}
 
@@ -221,7 +225,7 @@ class RAGService:
                 if state is None:
                     # 新 id：需要询问姓名一次，并记录到状态文件
                     should_ask_name = True
-                    self.second = True
+                    self.second_ask = True
                     self.visitor_state.mark_asked(vid)
                 else:
                     # 旧 id：已询问过或存在记录，不再询问
