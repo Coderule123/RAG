@@ -101,6 +101,9 @@ class RAGService:
         # 读取重排开关
         retrieval_cfg = self.config.get("retrieval", {})
         self.use_reranker = retrieval_cfg.get("use_reranker", True)
+        self.ask_name_reask_timeout_sec = float(
+            retrieval_cfg.get("ask_name_reask_timeout_sec", 5000)
+        )
 
         # 初始化 Embedding 服务（与建库同模型）
         self.embed_service = EmbeddingService(
@@ -189,36 +192,47 @@ class RAGService:
         # 如果调用方明确要求这是提取姓名的请求，重置实例级 second 为 False
         if is_obtain_name:
             self.second_ask = False
+            self.second = False
 
         if self.second_ask:
             self.second = True
 
         timings = {}
 
-        # 检索
-        t0 = time.perf_counter()
-        retrieved = self.retriever.retrieve(query, top_k)
-        timings["retrieve"] = time.perf_counter() - t0
-
-        # 重排（根据配置决定是否执行）
-        if self.use_reranker and self.reranker is not None:
-            t1 = time.perf_counter()
-            reranked = self.reranker.rerank(query, retrieved, rerank_top_n)
-            timings["rerank"] = time.perf_counter() - t1
-        else:
-            # 未启用重排时，直接使用检索结果，并截取前 rerank_top_n 条
-            reranked = retrieved[:rerank_top_n]
+        if is_obtain_name:
+            logger.info("姓名抽取模式，跳过检索与访客询问状态")
+            retrieved: list = []
+            reranked: list = []
+            timings["retrieve"] = 0.0
             timings["rerank"] = 0.0
+            context = ""
+            should_ask_name = False
+        else:
+            # 检索
+            t0 = time.perf_counter()
+            retrieved = self.retriever.retrieve(query, top_k)
+            timings["retrieve"] = time.perf_counter() - t0
+
+            # 重排（根据配置决定是否执行）
+            if self.use_reranker and self.reranker is not None:
+                t1 = time.perf_counter()
+                reranked = self.reranker.rerank(query, retrieved, rerank_top_n)
+                timings["rerank"] = time.perf_counter() - t1
+            else:
+                # 未启用重排时，直接使用检索结果，并截取前 rerank_top_n 条
+                reranked = retrieved[:rerank_top_n]
+                timings["rerank"] = 0.0
+
+            context = build_context(reranked, vector_threshold=vector_threshold)
+            should_ask_name = False
 
         # 构建上下文和 Prompt
         t2 = time.perf_counter()
-        context = build_context(reranked, vector_threshold=vector_threshold)
         visit_locations = self.config.get("visit_locations")
         vid = (vision_user_id or "").strip() or None
-        should_ask_name = False
 
         # 新传入的数字 id（非人名）且尚无状态 -> 需要询问姓名一次
-        if vid:
+        if not is_obtain_name and vid:
             if not is_concrete_person_name(vid):
                 # 数字 id / 匿名 id 路径：查询状态文件
                 state = self.visitor_state.get(vid)
@@ -228,8 +242,12 @@ class RAGService:
                     self.second_ask = True
                     self.visitor_state.mark_asked(vid)
                 else:
-                    # 旧 id：已询问过或存在记录，不再询问
-                    should_ask_name = False
+                    # 旧 id：若距离首次询问超过阈值，则重新询问一次
+                    should_ask_name = self.visitor_state.should_reask(
+                        vid, self.ask_name_reask_timeout_sec
+                    )
+                    if should_ask_name:
+                        self.second_ask = True
             else:
                 # 传入的是人名，直接传递给 prompt，状态文件不处理
                 should_ask_name = False

@@ -120,8 +120,9 @@ def _build_user_context_lines(
             logger.info("访客标识首次询问姓名: %s", display_id)
         return (
             "【访客身份】\n"
-            "当前仅识别到访客标识，尚未获知对方真实姓名。请在回答中自然、礼貌地询问面前的人如何称呼；"
-            "不要编造或假设姓名，也不要使用访客编号、时间戳或匿名 ID 来称呼对方。\n"
+            "识别到顾客初次来访，尚未获知对方真实姓名。\n"
+            "本次回复必须向访客询问如何称呼，不要编造或假设姓名，"
+            "也不要使用访客编号、时间戳或匿名 ID 来称呼对方。\n"
         )
 
     if display_id:
@@ -131,6 +132,146 @@ def _build_user_context_lines(
         "当前未获得对方姓名。请正常回答问题，不要使用访客编号、时间戳或匿名 ID 来称呼对方，"
         "也不要再次主动询问姓名。\n"
     )
+
+def _build_ask_name_prompt(query: str) -> str:
+    """
+    构建首次询问访客姓名的专用提示词。
+
+    与常规 RAG 提示分离，避免模型被【资料】/【问题】带偏去作答，
+    并显式覆盖默认系统提示中的 <INTENT> 标签要求。
+    """
+    user_utterance = (query or "").strip()
+    utterance_block = ""
+    if user_utterance:
+        utterance_block = (
+            f"\n【用户刚才说】\n{user_utterance}\n"
+            "（请勿回答上述内容；仅可在问候后紧接询问称呼。）\n"
+        )
+
+    template = (
+        "【最高优先级 — 询问姓名】\n"
+        "面前的访客初次来访，系统尚未获知对方真实姓名。\n"
+        "本次回复的唯一任务是：向访客自然、礼貌地询问如何称呼。\n"
+        "\n"
+        "【输出要求 — 必须全部遵守】\n"
+        "1. 直接输出面向访客的中文口语回复，不要输出 <INTENT>、<LOCATION> 等任何标签"
+        "（本段要求覆盖默认系统提示中的状态标签规则）。\n"
+        "2. 回复正文必须是询问姓名/称呼的句子，例如："
+        "「您好，请问怎么称呼您？」「您好，方便告诉我您的称呼吗？」\n"
+        "3. 不要回答用户问题，不要引用检索资料，不要介绍产品或展厅内容。\n"
+        "4. 不要编造或假设对方姓名；不要用访客编号、时间戳或匿名 ID 称呼对方。\n"
+        "5. 控制在 40 字以内，语气亲切自然。\n"
+        "{utterance_block}"
+        "\n"
+        "请直接输出询问姓名的回复："
+    )
+    return template.format(utterance_block=utterance_block)
+
+
+# LLM 姓名抽取常见无效输出
+_EXTRACT_NAME_EMPTY_TOKENS = frozenset(
+    {
+        "<EMPTY>",
+        '""',
+        "''",
+        "无",
+        "未知",
+        "不知道",
+        "未提供",
+        "空",
+        "空字符串",
+        "none",
+        "null",
+        "n/a",
+    }
+)
+
+_INTENT_TAG_PATTERN = re.compile(r"<INTENT>.*?</INTENT>", re.DOTALL | re.IGNORECASE)
+_LOCATION_TAG_PATTERN = re.compile(r"<LOCATION>.*?</LOCATION>", re.DOTALL | re.IGNORECASE)
+_CHINESE_NAME_PATTERN = re.compile(r"[\u4e00-\u9fff]{2,4}")
+
+
+def sanitize_extracted_name(raw: str | None) -> str:
+    """
+    清洗 LLM 姓名抽取结果：仅保留 2–4 个连续汉字的人名，否则返回空字符串。
+    """
+    if raw is None:
+        return ""
+    text = str(raw).strip()
+    if not text:
+        return ""
+    text = _INTENT_TAG_PATTERN.sub("", text)
+    text = _LOCATION_TAG_PATTERN.sub("", text).strip()
+    if text.lower() in _EXTRACT_NAME_EMPTY_TOKENS or text in _EXTRACT_NAME_EMPTY_TOKENS:
+        return ""
+    # 去掉常见包裹符号
+    text = text.strip("「」『』\"' \t\n\r，。！？!?；;：:")
+    if not text or text.lower() in _EXTRACT_NAME_EMPTY_TOKENS:
+        return ""
+    match = _CHINESE_NAME_PATTERN.search(text)
+    if not match:
+        return ""
+    candidate = match.group(0)
+    if not is_concrete_person_name(candidate):
+        return ""
+    return candidate
+
+
+def _build_obtain_name_prompt(query: str) -> str:
+    """
+    构建从用户回复中抽取姓名的专用提示词。
+
+    与常规 RAG / 询问姓名提示分离，要求模型仅输出姓名或空行，
+    并显式覆盖默认系统提示中的 <INTENT> 标签要求。
+    """
+    user_utterance = (query or "").strip()
+    utterance_block = ""
+    if user_utterance:
+        utterance_block = f"\n【待分析文本】\n{user_utterance}\n"
+
+    template = (
+        "【最高优先级 — 姓名抽取（非对话）】\n"
+        "你是姓名抽取器。从【待分析文本】中判断访客是否在告知自己的真实中文姓名。\n"
+        "本任务与展厅介绍、意图状态、RAG 资料无关。\n"
+        "\n"
+        "【输出契约 — 违反任意一条即错误】\n"
+        "1. 只输出一行纯文本：要么是姓名本身，要么是空行（零字符，不要输出任何可见字符）。\n"
+        "2. 禁止输出：<INTENT>、<LOCATION>、书名号、引号、冒号、解释、道歉、问候、"
+        "「无法确定」「无」「不知道」、<EMPTY>、JSON、英文或其他任何附加内容。\n"
+        "3. 姓名规则：2–4 个连续汉字，为人名用字；可去掉「我叫/叫我/是/姓」等前缀后只保留姓名。\n"
+        "4. 以下情况必须输出空行（零字符）：\n"
+        "   - 未提供姓名、拒绝透露、含糊其辞\n"
+        "   - 仅寒暄/打招呼/呼叫机器人（如「你好」「小特」）\n"
+        "   - 在问产品、展厅、价格等业务问题\n"
+        "   - 文本中的汉字属于车名、地名、品牌、他人姓名，而非访客自称\n"
+        "5. 不得编造姓名；不得把机器人名、品牌名、车型名当作访客姓名。\n"
+        "6. 本任务禁止输出任何 INTENT 状态标签（输出标签视为失败）。\n"
+        "（本段要求覆盖默认系统提示中的状态标签规则。）\n"
+        "\n"
+        "【示例 — 输出必须与「期望输出」完全一致】\n"
+        "待分析文本：叫我张三吧\n"
+        "期望输出：张三\n"
+        "\n"
+        "待分析文本：我姓李，名四是四行的四\n"
+        "期望输出：李四\n"
+        "\n"
+        "待分析文本：不想告诉你我的名字\n"
+        "期望输出：\n"
+        "\n"
+        "待分析文本：你好，小特\n"
+        "期望输出：\n"
+        "\n"
+        "待分析文本：智己 LS6 多少钱\n"
+        "期望输出：\n"
+        "\n"
+        "待分析文本：大家都叫我小王\n"
+        "期望输出：小王\n"
+        "{utterance_block}"
+        "\n"
+        "请只输出姓名或空行："
+    )
+    return template.format(utterance_block=utterance_block)
+
 
 def build_prompt(
     query: str,
@@ -150,15 +291,14 @@ def build_prompt(
     3. 根据用户问题判断意图状态，并在回答末尾附加 <INTENT>状态</INTENT>。
     4. 参观意向且含具体地点时，在 <INTENT> 后附加 <LOCATION>地点</LOCATION>。
     """
-    # 如果 caller 明确要求这是一个“提取姓名”的 prompt，构建专用的提取姓名提示语并返回。
     if is_obtain_name:
-        # 针对 LLM 的姓名抽取提示，要求仅返回姓名（中文），无法确定则返回空字符串。
-        template = (
-            "你是一个助手。请从下面的用户回复中提取用户的真实中文姓名（仅姓名，不要其他说明）。"
-            "如果无法确定真实姓名，请返回空字符串。\n\n用户回复：\n{question}\n"
-        )
-        prompt = ChatPromptTemplate.from_template(template)
-        return prompt.format(question=query)
+        logger.info("构建姓名抽取专用 prompt")
+        return _build_obtain_name_prompt(query)
+
+    # 首次见面需询问姓名时，使用专用 prompt，避免与 RAG 作答指令及默认 INTENT 规则冲突。
+    if should_ask_name:
+        logger.info("构建询问姓名专用 prompt")
+        return _build_ask_name_prompt(query)
 
     user_line = _build_user_context_lines(
         vision_user_id=vision_user_id,
@@ -168,8 +308,12 @@ def build_prompt(
     if detected_location:
         logger.info("参观意向已识别地点: %s", detected_location)
 
+    base_instruction = (
+        "基于【资料】回答问题。如果资料不足以回答问题，请明确回复“抱歉，我无法回答你的问题”。不要自己编造答案。优先以【资料】中的内容回答问题，如果【资料】中的内容不足以回答问题，则根据历史对话记录合理推测每次问题的主语，并结合【资料】中的内容回答问题。\n"
+    )
+
     closing = (
-        "请基于【资料】输出完整回答。"
+        "请基于【资料】输出完整回答。充分理解并应用【资料】中的内容，使得回答丰富且有深度。"
         + "并按照【意图状态】要求输出 <INTENT> 标签"
         + ("及 <LOCATION> 标签（如适用）" if detected_location else "")
         + "："
@@ -177,7 +321,7 @@ def build_prompt(
 
     template = (
         "你是一个智能导购助手。请严格遵循以下要求：\n"
-        "基于【资料】回答问题。如果资料不足以回答问题，请明确回复“抱歉，我无法回答你的问题”。\n"
+        "{base_instruction}\n"
         "\n"
         "{user_line}\n"
         "{intent_line}\n"
@@ -191,6 +335,7 @@ def build_prompt(
     )
     prompt = ChatPromptTemplate.from_template(template)
     return prompt.format(
+        base_instruction=base_instruction,
         user_line=user_line,
         intent_line=intent_line,
         context=context,

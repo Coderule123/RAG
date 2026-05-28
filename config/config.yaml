@@ -23,6 +23,7 @@ retrieval:
   rerank_top_n: 4       # 重排后保留条数
   use_reranker: false   # 是否启用重排，设为 false 则跳过重排步骤
   vector_threshold: 0.3  # 向量分数阈值
+  ask_name_reask_timeout_sec: 18000  # 姓名重问阈值：距离首次询问超过该秒数将再次询问
 
 # 展厅可导航地点（参观意向问题中匹配后写入 <LOCATION> 标签）
 visit_locations:
