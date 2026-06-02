@@ -52,7 +52,11 @@ def main() -> None:
     models = config.get("models", {})
     hf_cfg = config.get("huggingface", {})
 
-    log_file = setup_logging(paths.get("doc_logs_dir", "./logs/doc"), logger_name="rag")
+    log_file = setup_logging(
+        paths.get("doc_logs_dir", "./logs/doc"),
+        logger_name="rag",
+        log_mode="timestamp",
+    )
     logger = get_logger("rag")
     logger.info("document_processor 启动: log_file=%s", log_file)
 
