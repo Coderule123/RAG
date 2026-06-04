@@ -34,6 +34,24 @@ def canonical_source_path(file_path: Path) -> str:
     return str(rel).replace("\\", "/")
 
 
+def resolve_doc_tag(file_path: Path, data_root: Path, default_tag: str = "general") -> str:
+    """
+    根据文件相对 data_dir 的一级子目录推断标签：
+      - data/ls6/LS6.txt          -> "ls6"
+      - data/ls6/sub/x.txt        -> "ls6"（仅取一级子目录）
+      - data/car_info.json        -> default_tag（直接位于 data_dir 下）
+    无法定位到 data_root 之下时退回 default_tag。
+    """
+    try:
+        rel = file_path.resolve().relative_to(data_root.resolve())
+    except ValueError:
+        return default_tag
+    parts = rel.parts
+    if len(parts) > 1:
+        return parts[0]
+    return default_tag
+
+
 def normalize_source_key(key: str) -> str:
     """将 doc_hash.json 等处的 source 键规范为与 canonical_source_path 相同的相对路径（兼容旧版绝对路径）。"""
     if not key:
@@ -286,6 +304,7 @@ def load_documents(
             continue
         file_hash = compute_file_hash(file_path)
         source = canonical_source_path(file_path)
+        tag = resolve_doc_tag(file_path, root)
         if incremental and registry.get(source) == file_hash:
             skipped_unchanged += 1
             continue
@@ -312,6 +331,7 @@ def load_documents(
                 "page", metadata.get("page_number", page_idx)
             )
             metadata["doc_hash"] = metadata.get("doc_hash", file_hash)
+            metadata["tag"] = tag
             records.append(Document(page_content=text, metadata=metadata))
     stats = {
         "failed_files": failed_files,

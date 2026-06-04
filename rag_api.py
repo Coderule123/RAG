@@ -11,10 +11,11 @@ LangChain 的 FAISS.load_local / similarity_search 依赖传入的 Embeddings �
 
 import argparse
 import json
+import re
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from RAG.config.config_runtime import load_config
 from RAG.config.hf_runtime import setup_huggingface_env
@@ -23,6 +24,8 @@ from RAG.DP.embedding_service import EmbeddingService
 
 from .context_builder import build_context
 from .prompt_builder import (
+    ACTIVE_ASK_TAG,
+    DEFAULT_ACTIVE_ASK_RETRIEVAL_QUERY,
     build_prompt,
     extract_visit_location,
     is_concrete_person_name,
@@ -98,6 +101,12 @@ class RAGService:
         self.second = False
         self.second_ask = False
 
+        # tag 检索状态：_active_tags 跨 query() 调用持久保存，实现「沿用上次 tag」
+        self._active_tags: List[str] = []
+        self._known_tags: List[str] = self._load_known_tags()
+        self._tag_pattern: Optional[re.Pattern] = self._build_tag_pattern(self._known_tags)
+        logger.info("已知 tag: %s", self._known_tags)
+
         # 读取重排开关
         retrieval_cfg = self.config.get("retrieval", {})
         self.use_reranker = retrieval_cfg.get("use_reranker", True)
@@ -132,6 +141,48 @@ class RAGService:
 
         logger.info("RAGService 初始化完成（模型已加载）")
 
+    def _load_known_tags(self) -> List[str]:
+        """
+        扫描 index_store/metadata/ 下的一级子目录名，作为已知 tag 集合。
+        与 DP/document_loader 的 resolve_doc_tag 逻辑对应：子目录名即 tag。
+        结果按字符串长度降序排列，供正则构建时保证「长 tag 优先匹配」。
+        """
+        paths = self.config.get("paths", {})
+        metadata_dir = Path(paths.get("index_dir", "./RAG/assets/index_store")) / "metadata"
+        if not metadata_dir.exists():
+            return []
+        tags = sorted(
+            {p.name for p in metadata_dir.iterdir() if p.is_dir()},
+            key=len,
+            reverse=True,
+        )
+        return tags
+
+    @staticmethod
+    def _build_tag_pattern(tags: List[str]) -> Optional[re.Pattern]:
+        """
+        用已知 tag 列表构建大小写不敏感的边界正则。
+        边界定义：tag 前后均不为字母或数字（兼容中文语境）。
+        tags 须已按长度降序排列（长 tag 优先），避免 l6 提前匹配 ls6 的后半段。
+        """
+        if not tags:
+            return None
+        alternation = "|".join(re.escape(t) for t in tags)
+        return re.compile(
+            r"(?<![a-zA-Z0-9])(" + alternation + r")(?![a-zA-Z0-9])",
+            re.IGNORECASE,
+        )
+
+    def _detect_tags_from_query(self, query: str) -> List[str]:
+        """
+        用正则从 query 中提取所有已知 tag（去重、保持 _known_tags 顺序）。
+        例：「智己LS6的漆面颜色」-> ["ls6"]
+        """
+        if not self._tag_pattern:
+            return []
+        found = {m.group(1).lower() for m in self._tag_pattern.finditer(query)}
+        return [t for t in self._known_tags if t in found]
+
     def _print_result(self, result: Dict[str, Any]) -> None:
         """打印 RAG 结果的详细信息（日志+控制台），与原有 print_rag_result 功能一致"""
         logger.info("检索耗时: %.4fs", result["timings"]["retrieve"])
@@ -143,6 +194,7 @@ class RAGService:
 
         output = {
             "query": result["query"],
+            "active_tags": result.get("active_tags", []),
             "retrieved_count": len(result["retrieved_docs"]),
             "reranked_count": len(result["reranked_docs"]),
         }
@@ -173,11 +225,28 @@ class RAGService:
         voice_user_id: Optional[str] = None,
         verbose: bool = True,
         is_obtain_name: bool = False,
+        is_active_ask: bool = False,
+        tag: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
-        """执行完整的 RAG 流程：检索 → 重排 → 构建上下文 → 生成 Prompt。"""
-        if not query or not query.strip():
+        """
+        执行完整的 RAG 流程：检索 → 重排 → 构建上下文 → 生成 Prompt。
+
+        is_active_ask：主动招呼模式。无顾客对话时由机器人先开口；仅检索 tag=active_ask
+          的资料，并使用专用 prompt。query 可为空，空时用默认语义查询做检索。
+
+        tag：指定检索范围的 tag 列表（对应 metadata.tag 字段，如 ["ls6", "ls7"]）。
+          - 显式传入非 None 列表：直接使用并更新实例 _active_tags。
+          - 传入 None（默认）：先从 query 正则解析 tag；解析到则更新并使用，
+            否则沿用实例 _active_tags（跨调用持久化）。
+          - 传入空列表 []：清除历史 tag，本次全库检索。
+          - is_active_ask=True 时忽略上述规则，固定检索 active_ask，且不改写 _active_tags。
+        """
+        if is_obtain_name and is_active_ask:
+            raise ValueError("is_obtain_name 与 is_active_ask 不能同时为 True")
+
+        raw_query = (query or "").strip()
+        if not raw_query and not is_active_ask:
             raise ValueError("query 不能为空")
-        query = query.strip()
 
         # 参数默认值
         retrieval_cfg = self.config.get("retrieval", {})
@@ -188,6 +257,40 @@ class RAGService:
             if rerank_top_n is not None
             else int(retrieval_cfg.get("rerank_top_n", 4))
         )
+
+        active_ask_tag = retrieval_cfg.get("active_ask_tag", ACTIVE_ASK_TAG)
+        default_active_ask_query = retrieval_cfg.get(
+            "active_ask_retrieval_query", DEFAULT_ACTIVE_ASK_RETRIEVAL_QUERY
+        )
+
+        # ── tag 解析 ─────────────────────────────────────────────────────────
+        if is_active_ask:
+            resolved_tags = [str(active_ask_tag).lower()]
+            retrieve_query = raw_query or default_active_ask_query
+            logger.info(
+                "主动招呼模式: tag=%s retrieve_query=%s",
+                resolved_tags,
+                retrieve_query,
+            )
+        else:
+            retrieve_query = raw_query
+            if tag is not None:
+                resolved_tags = [t.lower() for t in tag if t]
+                self._active_tags = resolved_tags
+                logger.info("tag 来源=显式传入: %s", resolved_tags)
+            else:
+                detected = self._detect_tags_from_query(raw_query)
+                if detected:
+                    resolved_tags = detected
+                    self._active_tags = resolved_tags
+                    logger.info("tag 来源=query 解析: %s", resolved_tags)
+                else:
+                    resolved_tags = self._active_tags
+                    logger.info(
+                        "tag 来源=沿用历史: %s",
+                        resolved_tags if resolved_tags else "无（全库检索）",
+                    )
+        # ─────────────────────────────────────────────────────────────────────
 
         # 如果调用方明确要求这是提取姓名的请求，重置实例级 second 为 False
         if is_obtain_name:
@@ -208,9 +311,13 @@ class RAGService:
             context = ""
             should_ask_name = False
         else:
-            # 检索
+            # 检索（tags=None 时全库检索，tags 非空时按 tag 后过滤）
             t0 = time.perf_counter()
-            retrieved = self.retriever.retrieve(query, top_k)
+            retrieved = self.retriever.retrieve(
+                retrieve_query,
+                top_k,
+                tags=resolved_tags if resolved_tags else None,
+            )
             timings["retrieve"] = time.perf_counter() - t0
 
             # 重排（根据配置决定是否执行）
@@ -253,13 +360,14 @@ class RAGService:
                 should_ask_name = False
 
         prompt = build_prompt(
-            query,
+            raw_query,
             context,
             vision_user_id=vision_user_id,
             voice_user_id=voice_user_id,
             visit_locations=visit_locations,
             should_ask_name=should_ask_name,
             is_obtain_name=is_obtain_name,
+            is_active_ask=is_active_ask,
         )
         timings["build_context_prompt"] = time.perf_counter() - t2
         timings["total"] = (
@@ -267,13 +375,16 @@ class RAGService:
         )
 
         result = {
-            "query": query,
+            "query": raw_query,
+            "retrieve_query": retrieve_query if is_active_ask else raw_query,
             "retrieved_docs": retrieved,
             "reranked_docs": reranked,
             "context": context,
             "prompt": prompt,
             "timings": timings,
             "second": self.second,
+            "active_tags": resolved_tags,
+            "is_active_ask": is_active_ask,
         }
         if verbose:
             self._print_result(result)

@@ -1,6 +1,6 @@
-import hashlib
 import json
 import re
+import shutil
 import sqlite3
 from collections import defaultdict
 from pathlib import Path
@@ -30,7 +30,7 @@ class VectorStore:
     # 与 LangChain FAISS.save_local / load_local 默认 index_name 一致
     _FAISS_INDEX_NAME = "index"
 
-    def __init__(self, index_dir: str):
+    def __init__(self, index_dir: str, data_dir: Optional[str] = None):
         # 索引根目录：其下 faiss_store/ 为 LangChain 持久化目录
         self.index_dir = Path(index_dir)
         self.index_dir.mkdir(parents=True, exist_ok=True)
@@ -38,6 +38,9 @@ class VectorStore:
         self.doc_hash_path = self.index_dir / "doc_hash.json"
         self.metadata_docs_dir = self.index_dir / "metadata"
         self.sqlite_path = self.index_dir / "chunks.db"
+        # 数据根目录（规范为相对仓库根，如 RAG/assets/data）：用于把 source 映射为
+        # metadata/ 下镜像 data/ 结构的相对路径（data/ls6/LS6.txt -> metadata/ls6/LS6.json）。
+        self._data_root_rel = normalize_source_key(data_dir) if data_dir else ""
         self._init_sqlite()
 
     def _faiss_persisted_ready(self) -> bool:
@@ -126,23 +129,35 @@ class VectorStore:
             records.append({"text": doc.page_content, "metadata": dict(doc.metadata)})
         return records
 
-    @staticmethod
-    def _metadata_basename_for_source(source: str, basename_groups: Dict[str, List[str]]) -> str:
+    def _metadata_relpath_for_source(self, source: str) -> Path:
         """
-        以加载文档的文件名（路径 basename）作为 metadata/ 下文件名；同名不同路径时加短哈希区分。
+        将 source 映射为 metadata/ 下「镜像 data/ 目录结构」的 .json 相对路径：
+          data_root=RAG/assets/data, source=RAG/assets/data/ls6/LS6.txt -> ls6/LS6.json
+          source=RAG/assets/data/car_info.json                          -> car_info.json
+        source 不在 data_root 之下（或未配置 data_root）时退回使用 basename。
         """
-        name = Path(source).name.strip() or "unknown"
-        peers = basename_groups.get(name, [])
-        stem = Path(name).stem
-        if len(peers) <= 1:
-            return f"{stem}.json" if stem else "unknown.json"
-        short = hashlib.sha256(source.encode("utf-8")).hexdigest()[:8]
-        return f"{stem}__{short}.json" if stem else f"{short}.json"
+        norm = normalize_source_key(source)
+        rel: Optional[Path] = None
+        if self._data_root_rel:
+            try:
+                rel = Path(norm).relative_to(self._data_root_rel)
+            except ValueError:
+                rel = None
+        if rel is None or not rel.parts:
+            rel = Path(Path(norm).name)
+        return rel.with_suffix(".json")
+
+    def _reset_metadata_dir(self) -> None:
+        """清空并重建 metadata/ 目录（递归删除旧的分文件与子目录），用于全量重写。"""
+        if self.metadata_docs_dir.exists():
+            shutil.rmtree(self.metadata_docs_dir, ignore_errors=True)
+        self.metadata_docs_dir.mkdir(parents=True, exist_ok=True)
 
     def _persist_doc_hash_and_split_metadata(self, all_meta: List[Dict]) -> None:
         """
         写入 doc_hash.json（全量 source -> doc_hash），并在 metadata/ 下按文档拆分 JSON，
-        单文件内容为分块条目列表（仅 text + metadata），metadata 中不含 source、doc_hash；文件名为文档 basename。
+        目录结构镜像 data/（data/ls6/LS6.txt -> metadata/ls6/LS6.json）；
+        单文件内容为分块条目列表（仅 text + metadata），metadata 中不含 source、doc_hash。
         """
         doc_hashes: Dict[str, str] = {}
         by_source: Dict[str, List[Dict]] = defaultdict(list)
@@ -168,18 +183,11 @@ class VectorStore:
             json.dumps(doc_hashes, ensure_ascii=False, indent=2), encoding="utf-8"
         )
 
-        self.metadata_docs_dir.mkdir(parents=True, exist_ok=True)
-        for path in self.metadata_docs_dir.iterdir():
-            if path.is_file():
-                path.unlink(missing_ok=True)
-
-        basename_groups: Dict[str, List[str]] = defaultdict(list)
-        for src in by_source:
-            basename_groups[Path(src).name].append(src)
+        self._reset_metadata_dir()
 
         for source, rows in by_source.items():
-            fname = self._metadata_basename_for_source(source, basename_groups)
-            out_path = self.metadata_docs_dir / fname
+            out_path = self.metadata_docs_dir / self._metadata_relpath_for_source(source)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text(
                 json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8"
             )
@@ -267,8 +275,11 @@ class VectorStore:
             conn.commit()
 
     def _sources_matching_metadata_filename(self, store, metadata_filename: str) -> List[str]:
-        """根据 metadata/ 下导出的 JSON 文件名，反查当前索引中的 source 列表。"""
-        name = (metadata_filename or "").strip()
+        """
+        根据 metadata/ 下导出的 JSON 路径反查当前索引中的 source 列表。
+        既支持镜像 data/ 结构的相对路径（如 ls6/LS6.json），也支持仅传 basename（如 LS6.json）。
+        """
+        name = (metadata_filename or "").strip().replace("\\", "/").lstrip("./")
         if not name:
             return []
         if not name.endswith(".json"):
@@ -281,14 +292,11 @@ class VectorStore:
                 if d.metadata.get("source")
             }
         )
-        basename_groups: Dict[str, List[str]] = defaultdict(list)
-        for src in sources_raw:
-            basename_groups[Path(src).name].append(src)
 
         matched: List[str] = []
         for src in sources_raw:
-            fname = self._metadata_basename_for_source(src, basename_groups)
-            if fname == name:
+            rel = self._metadata_relpath_for_source(src).as_posix()
+            if rel == name or Path(rel).name == name:
                 matched.append(src)
         return matched
 
@@ -389,10 +397,7 @@ class VectorStore:
         if not remaining:
             self._wipe_faiss_persistence()
             self.doc_hash_path.write_text("{}", encoding="utf-8")
-            self.metadata_docs_dir.mkdir(parents=True, exist_ok=True)
-            for path in self.metadata_docs_dir.iterdir():
-                if path.is_file():
-                    path.unlink(missing_ok=True)
+            self._reset_metadata_dir()
             with sqlite3.connect(self.sqlite_path) as conn:
                 conn.execute("DELETE FROM chunks")
                 conn.commit()

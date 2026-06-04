@@ -20,8 +20,8 @@ pip install -r requirements.txt -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web
 
 统一配置在 `config/config.yaml`，重点参数：
 
-- `paths.data_dir`：知识库目录（默认 `./RAG/assets/data`）
-- `paths.index_dir`：向量库根目录（默认 `./RAG/assets/index_store`），其下由 DP 自动生成 `faiss_store/`、`metadata/`（按文档文件名的分块元数据 JSON，条目中不含 `source`）、`doc_hash.json`（增量用文件哈希表）、`chunks.db`
+- `paths.data_dir`：知识库目录（默认 `./RAG/assets/data`）。支持按一级子目录归类，DP 会据此给每个 chunk 打 `tag` 标签：`data/ls6/LS6.txt` -> `tag=ls6`；直接位于 `data/` 下的文件 -> `tag=general`
+- `paths.index_dir`：向量库根目录（默认 `./RAG/assets/index_store`），其下由 DP 自动生成 `faiss_store/`、`metadata/`（分块元数据 JSON，**目录结构镜像 `data/`**，如 `data/ls6/LS6.txt` -> `metadata/ls6/LS6.json`；条目中不含 `source`）、`doc_hash.json`（增量用文件哈希表）、`chunks.db`
 - `paths.models_dir`：模型缓存目录（默认 `./assets/models`）
 - `models.embedding_model`：Embedding 模型
 - `models.reranker_model`：Reranker 模型
@@ -53,7 +53,7 @@ python3 -m RAG.DP.document_processor \
 
 ### 3.1 按 metadata 或 source 删除向量
 
-入库后，`index_store/metadata/` 下每个源文件对应一个 JSON（文件名由 `vector_store` 按数据文件 basename 生成，同名多路径时带 `__` 短哈希后缀）。条目中 `metadata.doc_id` 与 `metadata.chunk_id` 与 FAISS 内 chunk 一致（`doc_id` 来自 `semantic_splitter`：该次建库时进入切分器的 `Document` 顺序下标；多文件同一批入库时可能不是从 0 连续编号，**以当前 JSON 中显示的值为准**）。
+入库后，`index_store/metadata/` 下每个源文件对应一个 JSON，**目录结构镜像 `data/`**（如 `data/ls6/LS6.txt` -> `metadata/ls6/LS6.json`，`data/car_info.json` -> `metadata/car_info.json`）。条目中 `metadata.doc_id` 与 `metadata.chunk_id` 与 FAISS 内 chunk 一致（`doc_id` 来自 `semantic_splitter`：该次建库时进入切分器的 `Document` 顺序下标；多文件同一批入库时可能不是从 0 连续编号，**以当前 JSON 中显示的值为准**）。
 
 使用脚本 `RAG/DP/index_chunk_delete.py`（须与建库使用相同的 `models.embedding_model`）可按「metadata 文件名」或「原始 `source` 路径」删除，并在成功后**重写** `faiss_store/`、`metadata/`、`doc_hash.json`、`chunks.db`（与 `document_processor` 写入结构一致）。
 
@@ -97,7 +97,7 @@ python3 -m RAG.DP.index_chunk_delete \
   --doc-id 1
 ```
 
-说明：若多个不同路径映射到同一 metadata  basename，脚本会报错并列出候选 `source`，此时请改用 `--source` 明确指定。若删除后索引中**不再存在任何向量**，脚本会清空 FAISS 文件与 `doc_hash.json`（写入 `{}`）并清空 `metadata/` 与 `chunks.db`；之后需重新运行 `document_processor` 建库。
+说明：`--metadata` 既可传镜像 `data/` 结构的相对路径（如 `ls6/LS6.json`），也可只传 basename（如 `LS6.json`）；若 basename 在多个子目录下重名导致命中多个 `source`，脚本会报错并列出候选 `source`，此时请改用相对路径或 `--source` 明确指定。若删除后索引中**不再存在任何向量**，脚本会清空 FAISS 文件与 `doc_hash.json`（写入 `{}`）并清空 `metadata/` 与 `chunks.db`；之后需重新运行 `document_processor` 建库。
 
 ## 4. RAG：生成完整 Prompt（不调用 LLM）
 
@@ -151,7 +151,7 @@ python3 -m RAG.rag_api --query "RAG是什么？"--user-id "张三"
 - `DP/document_loader.py`：文档加载
 - `DP/semantic_splitter.py`：语义切分
 - `DP/embedding_service.py`：Embedding 封装
-- `DP/vector_store.py`：LangChain FAISS 持久化，维护 `doc_hash.json` 与 `metadata/` 分文件元数据，并提供 `delete_by_metadata_selector` 按 `source` / metadata 文件名与 `doc_id`、`chunk_id` 删除后重写落盘
+- `DP/vector_store.py`：LangChain FAISS 持久化，维护 `doc_hash.json` 与 `metadata/`（镜像 `data/` 目录结构）分文件元数据，并提供 `delete_by_metadata_selector` 按 `source` / metadata 路径与 `doc_id`、`chunk_id` 删除后重写落盘
 - `DP/index_chunk_delete.py`：删除脚本入口（调用上述能力）
 - `DP/document_processor.py`：预处理流程入口
 
@@ -183,4 +183,8 @@ rag_result = self.rag_client.query(query=user_text, user_id="张三")
 
 # 传入声纹姓名
 rag_result = self.rag_client.query(query=user_text, vision_user_id=vision_user_id, voice_user_id=voice_user_id)
+
+# 主动招呼（无顾客对话时机器人先开口；仅检索 data/active_ask/，专用 prompt，可不传 query）
+rag_result = self.rag_client.query(query="", is_active_ask=True)
+# 可选传入情境提示，用于检索与语气：rag_result = self.rag_client.query(query="顾客在展车旁驻足", is_active_ask=True)
 ```

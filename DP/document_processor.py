@@ -108,7 +108,7 @@ def main() -> None:
         sentence_cache_dir=hf_runtime["sentence_cache_dir"],
         local_files_only=bool(hf_cfg.get("local_files_only", False)),
     )
-    store = VectorStore(index_dir=args.index_dir)
+    store = VectorStore(index_dir=args.index_dir, data_dir=args.data_dir)
     result = store.build_or_append(
         chunks,
         embed,
