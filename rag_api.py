@@ -251,6 +251,10 @@ class RAGService:
         # 参数默认值
         retrieval_cfg = self.config.get("retrieval", {})
         vector_threshold = retrieval_cfg.get("vector_threshold", 0.6)
+        # 主动招呼模式已按 tag 收窄检索范围，使用专用（更低）阈值避免全部结果被过滤
+        active_ask_vector_threshold = float(
+            retrieval_cfg.get("active_ask_vector_threshold", 0.0)
+        )
         top_k = top_k if top_k is not None else int(retrieval_cfg.get("top_k", 8))
         rerank_top_n = (
             rerank_top_n
@@ -330,7 +334,8 @@ class RAGService:
                 reranked = retrieved[:rerank_top_n]
                 timings["rerank"] = 0.0
 
-            context = build_context(reranked, vector_threshold=vector_threshold)
+            ctx_threshold = active_ask_vector_threshold if is_active_ask else vector_threshold
+            context = build_context(reranked, vector_threshold=ctx_threshold)
             should_ask_name = False
 
         # 构建上下文和 Prompt

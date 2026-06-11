@@ -22,7 +22,8 @@ retrieval:
   top_k: 8              # 向量召回条数
   rerank_top_n: 4       # 重排后保留条数
   use_reranker: false   # 是否启用重排，设为 false 则跳过重排步骤
-  vector_threshold: 0.3  # 向量分数阈值
+  vector_threshold: 0.3  # 向量分数阈值（普通对话）
+  active_ask_vector_threshold: 0.0  # 主动招呼模式专用阈值：tag 已收窄至 active_ask，无需额外过滤
   ask_name_reask_timeout_sec: 18000  # 姓名重问阈值：距离首次询问超过该秒数将再次询问
   active_ask_tag: active_ask        # 主动招呼模式固定检索的 metadata.tag（对应 data/active_ask/）
   active_ask_retrieval_query: "展厅主动招呼 欢迎语 引导顾客交流 开口话术 接待用语"  # query 为空时用于向量检索
