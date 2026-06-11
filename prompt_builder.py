@@ -67,15 +67,20 @@ def _build_intent_instruction_lines(query: str,locations: Optional[List[str]] = 
 
     if detected_location:
         intent_rules += (
-            f"【参观意向】用户问题已提到地点：{detected_location}。\n"
-            f"如果状态为 <INTENT>NEEDS_GUIDANCE</INTENT> 则之后紧跟 <LOCATION>{detected_location}</LOCATION>，"
+            f"【参观意向】用户问题已命中预设地点：{detected_location}。\n"
+            f"若意图状态为 NEEDS_GUIDANCE，标签必须严格输出为 <INTENT>NEEDS_GUIDANCE<LOCATION>{detected_location}</LOCATION></INTENT>，"
+            f"<LOCATION> 内只能填写 {detected_location}，禁止填写任何其他文字。"
             "并在正文中简要说明将引导对方前往该地点。\n"
         )
     elif is_visit_intent_query(query):
+        loc_list = "、".join(locations or DEFAULT_VISIT_LOCATIONS)
         intent_rules += (
-            "【参观意向】\n用户问题体现参观/游览意向，但未指明具体地点（"
-            + "、".join(locations or DEFAULT_VISIT_LOCATIONS)
-            + "）。可主动询问想参观哪个区域，暂不输出 <LOCATION> 标签。\n"
+            "【参观意向】\n"
+            "用户表达了参观/游览意向，但问题中未命中任何预设地点（"
+            + loc_list
+            + "）。\n"
+            "本次必须询问用户想参观哪个区域；"
+            "严格禁止输出 <LOCATION> 标签，也禁止将用户话语中的任意文字作为地点值写入标签。\n"
         )
 
     return intent_rules, detected_location
@@ -376,11 +381,16 @@ def build_prompt(
         "基于【资料】回答问题。如果资料不足以回答问题，请明确回复“抱歉，我无法回答你的问题”。不要自己编造答案。优先以【资料】中的内容回答问题，如果【资料】中的内容不足以回答问题，则根据历史对话记录合理推测每次问题的主语，并结合【资料】中的内容回答问题。\n"
     )
 
+    if detected_location:
+        location_reminder = (
+            f"及 <LOCATION> 标签（<LOCATION> 内只能填写预设值 {detected_location}，禁止填写其他文字）"
+        )
+    else:
+        location_reminder = "（本次禁止输出 <LOCATION> 标签）" if is_visit_intent_query(query) else ""
+
     closing = (
         "请基于【资料】输出完整回答。充分理解并应用【资料】中的内容，使得回答丰富且有深度。"
-        + "并按照【意图状态】要求输出 <INTENT> 标签"
-        + ("及 <LOCATION> 标签（如适用）" if detected_location else "")
-        + "："
+        + f"并按照【意图状态】要求输出 <INTENT> 标签{location_reminder}："
     )
 
     template = (

@@ -29,9 +29,9 @@ retrieval:
 
 # 展厅可导航地点（参观意向问题中匹配后写入 <LOCATION> 标签）
 visit_locations:
-  - "A"
-  - "B"
-  - "C"
+  - "l6"
+  - "ls6"
+  - "ls7"
 
 # 切分与入库（DP/document_processor.py）
 vector_index:
