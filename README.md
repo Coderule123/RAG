@@ -188,3 +188,19 @@ rag_result = self.rag_client.query(query=user_text, vision_user_id=vision_user_i
 rag_result = self.rag_client.query(query="", is_active_ask=True)
 # 可选传入情境提示，用于检索与语气：rag_result = self.rag_client.query(query="顾客在展车旁驻足", is_active_ask=True)
 ```
+
+## 8. 管理页面（Web）
+
+独立 Web 管理页，用于文档上传/移动、向量查看与删除、一键增量建库。**不随 `run.sh` 启动**，需要时手动运行：
+
+```bash
+cd /path/to/chat_assistant
+python3 -m RAG.web.rag_web_server --host 0.0.0.0 --port 17892
+# 浏览器打开 http://127.0.0.1:17892
+```
+
+功能概览：
+
+- **文档管理**：查看 `data/` 下文件及索引状态，上传到指定 tag，移动或删除文件
+- **向量数据**：浏览 metadata 中的 chunk，按 doc_id / chunk_id 删除或删除整篇文档向量
+- **建库**：一键执行与 `document_processor` 相同的预处理/增量建库流程

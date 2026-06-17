@@ -1,0 +1,559 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>RAG 知识库管理</title>
+  <style>
+    :root {
+      --bg: #f7f9fc;
+      --panel: #ffffff;
+      --panel-2: #eef3f8;
+      --text: #1f2a37;
+      --muted: #6b7280;
+      --line: #d6dee8;
+      --accent: #0f766e;
+      --danger: #b91c1c;
+      --warn: #b45309;
+      --shadow: 0 10px 30px rgba(27, 39, 53, 0.08);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      font-family: "Noto Sans SC", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: radial-gradient(circle at 20% 0%, #d9f1ef 0%, var(--bg) 45%) no-repeat;
+      color: var(--text);
+      min-height: 100vh;
+    }
+
+    .layout {
+      display: flex;
+      flex-direction: column;
+      padding: 16px;
+      max-width: 1800px;
+      margin: 0 auto;
+      height: 100vh;
+    }
+
+    .header {
+      margin-bottom: 12px;
+    }
+
+    .header h1 {
+      margin: 0 0 4px;
+      font-size: 22px;
+    }
+
+    .header p {
+      margin: 0;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .tabs {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 10px;
+      margin-bottom: 12px;
+    }
+
+    .tab {
+      border: 1px solid var(--line);
+      background: #f8fafc;
+      color: var(--text);
+      border-radius: 12px;
+      padding: 12px 14px;
+      font-size: 15px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: transform 0.12s ease, border-color 0.2s ease, box-shadow 0.2s ease;
+    }
+
+    .tab:hover {
+      transform: translateY(-1px);
+      border-color: #9cb3cc;
+    }
+
+    .tab.active {
+      border-color: var(--accent);
+      box-shadow: 0 0 0 2px rgba(15, 118, 110, 0.14);
+      background: #ecfdf9;
+    }
+
+    .tab-content {
+      flex: 1;
+      min-height: 0;
+    }
+
+    .tab-pane {
+      height: 100%;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .tab-pane.hidden { display: none; }
+
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      box-shadow: var(--shadow);
+      display: flex;
+      flex-direction: column;
+      min-height: 0;
+      flex: 1;
+    }
+
+    .panel-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 10px;
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--line);
+      flex-wrap: wrap;
+    }
+
+    .panel-header h2 {
+      margin: 0;
+      font-size: 16px;
+    }
+
+    .toolbar {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+
+    .btn {
+      border: 1px solid var(--line);
+      background: #fff;
+      color: var(--text);
+      border-radius: 8px;
+      padding: 7px 12px;
+      font-size: 13px;
+      cursor: pointer;
+    }
+
+    .btn:hover { border-color: #9cb3cc; }
+
+    .btn.primary {
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+
+    .btn.danger {
+      background: #fef2f2;
+      border-color: #fecaca;
+      color: var(--danger);
+    }
+
+    .btn:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
+    .status {
+      padding: 8px 14px;
+      border-top: 1px solid var(--line);
+      font-size: 12px;
+      color: var(--muted);
+      min-height: 34px;
+    }
+
+    .split-layout {
+      display: grid;
+      grid-template-columns: 320px 1fr;
+      gap: 0;
+      flex: 1;
+      min-height: 0;
+    }
+
+    .sidebar {
+      border-right: 1px solid var(--line);
+      overflow: auto;
+      padding: 8px;
+    }
+
+    .detail {
+      overflow: auto;
+      padding: 14px;
+    }
+
+    .file-item {
+      border: 1px solid transparent;
+      border-radius: 8px;
+      padding: 8px 10px;
+      margin-bottom: 6px;
+      cursor: pointer;
+      background: #f8fafc;
+    }
+
+    .file-item:hover { border-color: #c5d3e3; }
+
+    .file-item.active {
+      border-color: var(--accent);
+      background: #ecfdf9;
+    }
+
+    .file-item .name {
+      font-size: 13px;
+      font-weight: 600;
+      word-break: break-all;
+    }
+
+    .file-item .meta {
+      font-size: 11px;
+      color: var(--muted);
+      margin-top: 4px;
+    }
+
+    .badge {
+      display: inline-block;
+      font-size: 10px;
+      padding: 2px 6px;
+      border-radius: 999px;
+      margin-left: 4px;
+      font-weight: 600;
+    }
+
+    .badge.indexed { background: #d1fae5; color: #065f46; }
+    .badge.not_indexed { background: #f3f4f6; color: #4b5563; }
+    .badge.changed { background: #fef3c7; color: #92400e; }
+
+    .tag-group-title {
+      font-size: 12px;
+      font-weight: 700;
+      color: var(--muted);
+      margin: 10px 4px 6px;
+      text-transform: uppercase;
+    }
+
+    .form-row {
+      display: flex;
+      gap: 8px;
+      align-items: center;
+      flex-wrap: wrap;
+      margin-bottom: 10px;
+    }
+
+    .form-row label {
+      font-size: 13px;
+      color: var(--muted);
+    }
+
+    input[type="text"],
+    input[type="file"],
+    select {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 7px 10px;
+      font-size: 13px;
+      background: #fff;
+    }
+
+    .detail dl {
+      margin: 0;
+      display: grid;
+      grid-template-columns: 100px 1fr;
+      gap: 8px 12px;
+      font-size: 13px;
+    }
+
+    .detail dt { color: var(--muted); }
+    .detail dd { margin: 0; word-break: break-all; }
+
+    .doc-preview-wrap {
+      margin-top: 16px;
+      border-top: 1px solid var(--line);
+      padding-top: 12px;
+    }
+
+    .doc-preview-wrap h3 {
+      margin: 0 0 8px;
+      font-size: 14px;
+    }
+
+    .doc-preview {
+      background: #0f172a;
+      color: #e2e8f0;
+      border-radius: 10px;
+      padding: 12px;
+      font-family: ui-monospace, "Noto Sans SC", monospace;
+      font-size: 12px;
+      white-space: pre-wrap;
+      word-break: break-word;
+      max-height: 420px;
+      overflow: auto;
+      margin: 0;
+    }
+
+    .doc-preview-note {
+      font-size: 11px;
+      color: var(--warn);
+      margin-top: 6px;
+    }
+
+    .index-split {
+      display: grid;
+      grid-template-columns: 280px 1fr;
+      gap: 0;
+      flex: 1;
+      min-height: 0;
+    }
+
+    .doc-index-item {
+      border: 1px solid transparent;
+      border-radius: 8px;
+      padding: 8px 10px;
+      margin-bottom: 6px;
+      cursor: pointer;
+      background: #f8fafc;
+    }
+
+    .doc-index-item:hover { border-color: #c5d3e3; }
+
+    .doc-index-item.active {
+      border-color: var(--accent);
+      background: #ecfdf9;
+    }
+
+    .doc-index-item .name {
+      font-size: 13px;
+      font-weight: 600;
+      word-break: break-all;
+    }
+
+    .doc-index-item .meta {
+      font-size: 11px;
+      color: var(--muted);
+      margin-top: 4px;
+    }
+
+    .chunk-list {
+      overflow: auto;
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .chunk-card {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 12px;
+      background: #fafbfc;
+    }
+
+    .chunk-card-header {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 16px;
+      align-items: center;
+      margin-bottom: 10px;
+      font-size: 12px;
+    }
+
+    .chunk-card-header .field {
+      color: var(--muted);
+    }
+
+    .chunk-card-header .field strong {
+      color: var(--text);
+      margin-left: 4px;
+    }
+
+    .chunk-card-actions {
+      margin-left: auto;
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+    }
+
+    .chunk-text {
+      font-size: 13px;
+      line-height: 1.6;
+      white-space: pre-wrap;
+      word-break: break-word;
+      background: #fff;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 10px;
+    }
+
+    .index-detail-empty {
+      color: var(--muted);
+      padding: 14px;
+    }
+
+    .summary-cards {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+      gap: 10px;
+      padding: 14px;
+    }
+
+    .card {
+      background: var(--panel-2);
+      border-radius: 10px;
+      padding: 12px;
+    }
+
+    .card .label {
+      font-size: 11px;
+      color: var(--muted);
+    }
+
+    .card .value {
+      font-size: 20px;
+      font-weight: 700;
+      margin-top: 4px;
+    }
+
+    .build-panel {
+      padding: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .config-readonly {
+      background: var(--panel-2);
+      border-radius: 10px;
+      padding: 12px;
+      font-size: 13px;
+      line-height: 1.6;
+    }
+
+    .job-result {
+      background: #0f172a;
+      color: #e2e8f0;
+      border-radius: 10px;
+      padding: 12px;
+      font-family: ui-monospace, monospace;
+      font-size: 12px;
+      white-space: pre-wrap;
+      max-height: 200px;
+      overflow: auto;
+    }
+
+    .log-viewer {
+      background: #0f172a;
+      color: #cbd5e1;
+      border-radius: 10px;
+      padding: 12px;
+      font-family: ui-monospace, monospace;
+      font-size: 11px;
+      white-space: pre-wrap;
+      flex: 1;
+      min-height: 120px;
+      overflow: auto;
+    }
+
+    .hidden { display: none !important; }
+
+    @media (max-width: 900px) {
+      .split-layout, .index-split { grid-template-columns: 1fr; }
+      .sidebar { border-right: none; border-bottom: 1px solid var(--line); max-height: 200px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="layout">
+    <div class="header">
+      <h1>RAG 知识库管理</h1>
+      <p>管理 data 文档、查看/删除向量索引、一键增量建库</p>
+    </div>
+
+    <div class="tabs">
+      <button class="tab active" id="tabData" type="button">文档管理</button>
+      <button class="tab" id="tabIndex" type="button">向量数据</button>
+      <button class="tab" id="tabBuild" type="button">建库</button>
+    </div>
+
+    <div class="tab-content">
+      <!-- Tab 1: Documents -->
+      <div class="tab-pane" id="dataPane">
+        <div class="panel">
+          <div class="panel-header">
+            <h2>知识库文档</h2>
+            <div class="toolbar">
+              <button class="btn" id="refreshDataBtn" type="button">刷新</button>
+            </div>
+          </div>
+          <div class="form-row" style="padding: 0 14px;">
+            <label for="uploadTag">上传到 tag</label>
+            <select id="uploadTag"></select>
+            <input type="text" id="uploadTagNew" placeholder="或输入新 tag" style="width:120px" />
+            <input type="file" id="uploadFile" accept=".txt,.md,.pdf,.docx,.csv,.json" />
+            <button class="btn primary" id="uploadBtn" type="button">上传</button>
+          </div>
+          <div class="split-layout">
+            <div class="sidebar" id="fileList"></div>
+            <div class="detail" id="fileDetail">
+              <p style="color:var(--muted)">选择左侧文件查看详情</p>
+            </div>
+          </div>
+          <div class="status" id="dataStatus">就绪</div>
+        </div>
+      </div>
+
+      <!-- Tab 2: Vector index -->
+      <div class="tab-pane hidden" id="indexPane">
+        <div class="panel">
+          <div class="panel-header">
+            <h2>向量数据</h2>
+            <div class="toolbar">
+              <input type="text" id="chunkFilter" placeholder="筛选文档名/tag…" />
+              <button class="btn" id="refreshIndexBtn" type="button">刷新</button>
+            </div>
+          </div>
+          <div class="summary-cards" id="indexSummary"></div>
+          <div class="index-split">
+            <div class="sidebar" id="docIndexList"></div>
+            <div class="chunk-list" id="chunkDetail">
+              <p class="index-detail-empty">选择左侧文档查看向量 chunk</p>
+            </div>
+          </div>
+          <div class="status" id="indexStatus">就绪</div>
+        </div>
+      </div>
+
+      <!-- Tab 3: Build -->
+      <div class="tab-pane hidden" id="buildPane">
+        <div class="panel">
+          <div class="panel-header">
+            <h2>文档预处理 / 建库</h2>
+            <div class="toolbar">
+              <label><input type="checkbox" id="incrementalCheck" checked /> 增量模式</label>
+              <button class="btn primary" id="buildBtn" type="button">一键建库</button>
+            </div>
+          </div>
+          <div class="build-panel">
+            <div class="config-readonly" id="buildConfigInfo">加载配置中…</div>
+            <div id="jobStatusBox" class="hidden">
+              <strong>任务状态：</strong><span id="jobStatusText">—</span>
+              <pre class="job-result hidden" id="jobResult"></pre>
+            </div>
+            <div>
+              <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px;">
+                <strong style="font-size:13px;">建库日志</strong>
+                <button class="btn" id="clearLogBtn" type="button">清空显示</button>
+              </div>
+              <pre class="log-viewer" id="docLogViewer"></pre>
+            </div>
+          </div>
+          <div class="status" id="buildStatus">就绪</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/rag_web_server.js"></script>
+</body>
+</html>
