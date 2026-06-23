@@ -27,8 +27,8 @@ from .prompt_builder import (
     ACTIVE_ASK_TAG,
     DEFAULT_ACTIVE_ASK_RETRIEVAL_QUERY,
     build_prompt,
-    extract_visit_location,
     is_concrete_person_name,
+    resolve_pending_navigation_tags,
 )
 from .reranker_service import RerankerService
 from .retriever_runtime import RetrieverRuntime
@@ -103,12 +103,17 @@ class RAGService:
 
         # tag 检索状态：_active_tags 跨 query() 调用持久保存，实现「沿用上次 tag」
         self._active_tags: List[str] = []
+        # 参观意向下轮生效的 tag（本轮仅写入，下轮 query 开始时消费）
+        self._pending_navigation_tags: Optional[List[str]] = None
         self._known_tags: List[str] = self._load_known_tags()
         self._tag_pattern: Optional[re.Pattern] = self._build_tag_pattern(self._known_tags)
         logger.info("已知 tag: %s", self._known_tags)
 
         # 读取重排开关
         retrieval_cfg = self.config.get("retrieval", {})
+        self.default_navigation_tag = str(
+            retrieval_cfg.get("default_navigation_tag", "ls6")
+        ).lower()
         self.use_reranker = retrieval_cfg.get("use_reranker", True)
         self.ask_name_reask_timeout_sec = float(
             retrieval_cfg.get("ask_name_reask_timeout_sec", 5000)
@@ -238,8 +243,11 @@ class RAGService:
           - 显式传入非 None 列表：直接使用并更新实例 _active_tags。
           - 传入 None（默认）：先从 query 正则解析 tag；解析到则更新并使用，
             否则沿用实例 _active_tags（跨调用持久化）。
-          - 传入空列表 []：清除历史 tag，本次全库检索。
+          - 传入空列表 []：清除历史 tag 与参观导航预设，本次全库检索。
           - is_active_ask=True 时忽略上述规则，固定检索 active_ask，且不改写 _active_tags。
+          - 参观意向：未命中预设地点时不输出 LOCATION（见 prompt_builder），并预设下轮 tag
+            为 default_navigation_tag；命中地点则预设下轮 tag 为命中值。预设 tag 在本轮不生效，
+            仅在下一次 query() 开始时写入 _active_tags。
         """
         if is_obtain_name and is_active_ask:
             raise ValueError("is_obtain_name 与 is_active_ask 不能同时为 True")
@@ -278,11 +286,22 @@ class RAGService:
             )
         else:
             retrieve_query = raw_query
+            visit_locations = self.config.get("visit_locations")
+
             if tag is not None:
                 resolved_tags = [t.lower() for t in tag if t]
                 self._active_tags = resolved_tags
+                if not resolved_tags:
+                    self._pending_navigation_tags = None
                 logger.info("tag 来源=显式传入: %s", resolved_tags)
             else:
+                if self._pending_navigation_tags is not None:
+                    self._active_tags = list(self._pending_navigation_tags)
+                    self._pending_navigation_tags = None
+                    logger.info(
+                        "tag 来源=上轮参观意向预设: %s", self._active_tags
+                    )
+
                 detected = self._detect_tags_from_query(raw_query)
                 if detected:
                     resolved_tags = detected
@@ -294,6 +313,16 @@ class RAGService:
                         "tag 来源=沿用历史: %s",
                         resolved_tags if resolved_tags else "无（全库检索）",
                     )
+
+            if not is_obtain_name:
+                nav_tags = resolve_pending_navigation_tags(
+                    raw_query,
+                    visit_locations,
+                    self.default_navigation_tag,
+                )
+                if nav_tags is not None:
+                    self._pending_navigation_tags = nav_tags
+                    logger.info("参观意向已记录，下轮 tag 预设: %s", nav_tags)
         # ─────────────────────────────────────────────────────────────────────
 
         # 如果调用方明确要求这是提取姓名的请求，重置实例级 second 为 False

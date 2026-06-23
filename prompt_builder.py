@@ -85,6 +85,27 @@ def _build_intent_instruction_lines(query: str,locations: Optional[List[str]] = 
 
     return intent_rules, detected_location
 
+
+def resolve_pending_navigation_tags(
+    query: str,
+    locations: Optional[List[str]] = None,
+    default_tag: str = "ls6",
+) -> Optional[List[str]]:
+    """
+    参观意向时计算「下轮检索」应使用的 tag 列表；非参观意向返回 None。
+
+    - 命中预设地点：tag 为命中的地点（多个地点则多个 tag）
+    - 未命中地点：tag 为 default_tag（导航默认展区，如 ls6）
+    """
+    if not is_visit_intent_query(query):
+        return None
+    detected = extract_visit_location(query, locations)
+    if detected:
+        return [t.strip().lower() for t in detected.split(",") if t.strip()]
+    default = (default_tag or "ls6").strip().lower()
+    return [default] if default else None
+
+
 def is_timestamp_user_id(user_id: str) -> bool:
     """判断是否为匿名访客时间戳标识（年_月_日_分_秒）。"""
     return bool(TIMESTAMP_USER_ID_PATTERN.match(user_id.strip()))
