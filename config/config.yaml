@@ -20,7 +20,7 @@ models:
 # 检索与重排（RAG/rag_api.py 可用 CLI 覆盖）
 retrieval:
   top_k: 8              # 向量召回条数
-  rerank_top_n: 4       # 重排后保留条数
+  rerank_top_n: 8       # 重排后保留条数
   use_reranker: false   # 是否启用重排，设为 false 则跳过重排步骤
   vector_threshold: 0.3  # 向量分数阈值（普通对话）
   active_ask_vector_threshold: 0.0  # 主动招呼模式专用阈值：tag 已收窄至 active_ask，无需额外过滤

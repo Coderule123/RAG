@@ -325,6 +325,13 @@ class RAGService:
                     logger.info("参观意向已记录，下轮 tag 预设: %s", nav_tags)
         # ─────────────────────────────────────────────────────────────────────
 
+        # 叠加 general tag：有具体车型 tag 时同步检索通用知识库（品牌介绍、通用 FAQ 等）。
+        # 仅在有具体 tag 且非主动招呼模式时叠加；全库检索（resolved_tags=[]）无需处理。
+        _GENERAL_TAG = "general"
+        if resolved_tags and not is_active_ask and _GENERAL_TAG not in resolved_tags:
+            resolved_tags = resolved_tags + [_GENERAL_TAG]
+            logger.info("叠加 general tag，最终检索 tag: %s", resolved_tags)
+
         # 如果调用方明确要求这是提取姓名的请求，重置实例级 second 为 False
         if is_obtain_name:
             self.second_ask = False
