@@ -100,6 +100,8 @@ class RAGService:
         # 每个实例维护自己的 second 标志，初始化为 False
         self.second = False
         self.second_ask = False
+        # 触发 second_ask 时对应的 visitor id，用于检测 user_id 切换
+        self._pending_name_user_id: Optional[str] = None
 
         # tag 检索状态：_active_tags 跨 query() 调用持久保存，实现「沿用上次 tag」
         self._active_tags: List[str] = []
@@ -332,8 +334,22 @@ class RAGService:
             resolved_tags = resolved_tags + [_GENERAL_TAG]
             logger.info("叠加 general tag，最终检索 tag: %s", resolved_tags)
 
+        # 提前计算 vid，供 user_id 切换检测使用
+        vid = (vision_user_id or "").strip() or None
+
         # 如果调用方明确要求这是提取姓名的请求，重置实例级 second 为 False
         if is_obtain_name:
+            self.second_ask = False
+            self.second = False
+
+        # user_id 切换检测：若在等待提取姓名阶段 user_id 已切换，放弃本次提取并重置，
+        # 以便新顾客先走正常询问姓名流程，下一轮再提取
+        if self.second_ask and vid != self._pending_name_user_id:
+            logger.info(
+                "user_id 已切换（%s -> %s），放弃上一轮姓名提取，将对新顾客重新询问姓名",
+                self._pending_name_user_id,
+                vid,
+            )
             self.second_ask = False
             self.second = False
 
@@ -377,7 +393,6 @@ class RAGService:
         # 构建上下文和 Prompt
         t2 = time.perf_counter()
         visit_locations = self.config.get("visit_locations")
-        vid = (vision_user_id or "").strip() or None
 
         # 新传入的数字 id（非人名）且尚无状态 -> 需要询问姓名一次
         if not is_obtain_name and vid:
@@ -388,6 +403,7 @@ class RAGService:
                     # 新 id：需要询问姓名一次，并记录到状态文件
                     should_ask_name = True
                     self.second_ask = True
+                    self._pending_name_user_id = vid
                     self.visitor_state.mark_asked(vid)
                 else:
                     # 旧 id：若距离首次询问超过阈值，则重新询问一次
@@ -396,6 +412,7 @@ class RAGService:
                     )
                     if should_ask_name:
                         self.second_ask = True
+                        self._pending_name_user_id = vid
             else:
                 # 传入的是人名，直接传递给 prompt，状态文件不处理
                 should_ask_name = False
