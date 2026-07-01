@@ -201,7 +201,7 @@ def _build_ask_name_prompt(query: str) -> str:
     return template.format(utterance_block=utterance_block)
 
 
-# LLM 姓名抽取常见无效输出
+# LLM 姓名抽取常见无效输出（道歉、问候、否定及 LLM 拒答用语）
 _EXTRACT_NAME_EMPTY_TOKENS = frozenset(
     {
         "<EMPTY>",
@@ -216,17 +216,77 @@ _EXTRACT_NAME_EMPTY_TOKENS = frozenset(
         "none",
         "null",
         "n/a",
+        "抱歉",
+        "对不起",
+        "您好",
+        "你好",
+        "无法",
+        "不能",
+        "无法确定",
+        "不确定",
+    }
+)
+
+# LLM 拒答/解释句中常见片段（出现即视为非姓名输出）
+_EXTRACT_NAME_REFUSAL_KEYWORDS = frozenset(
+    {
+        "抱歉",
+        "对不起",
+        "无法",
+        "不能",
+        "未能",
+        "未识别",
+        "无法识别",
+        "无法从",
+        "不能从",
+        "无法确定",
+        "不确定",
+        "不知道",
+        "未提供",
+        "无有效",
+        "无效",
+        "识别出",
+        "提取",
+        "抽取",
     }
 )
 
 _INTENT_TAG_PATTERN = re.compile(r"<INTENT>.*?</INTENT>", re.DOTALL | re.IGNORECASE)
 _LOCATION_TAG_PATTERN = re.compile(r"<LOCATION>.*?</LOCATION>", re.DOTALL | re.IGNORECASE)
-_CHINESE_NAME_PATTERN = re.compile(r"[\u4e00-\u9fff]{2,4}")
+_SENTENCE_PUNCT_PATTERN = re.compile(r"[，。！？；：,\.!?;:]")
+_VALID_NAME_PATTERN = re.compile(r"^[\u4e00-\u9fff]{2,4}$")
+_NAME_INTRO_PREFIX_PATTERN = re.compile(
+    r"^(?:我?(?:叫|是|姓)|名字(?:叫|是)?|称呼(?:是|叫)?|大家都?(?:都)?叫我)\s*"
+)
+_NAME_SUFFIX_PARTICLES = "吧呢啊呀哦哈嘛"
+
+
+def _strip_name_affixes(text: str) -> str:
+    """去掉「我叫/叫我/姓」等前缀及语气词后缀，保留疑似姓名片段。"""
+    name = text.strip("「」『』\"' \t\n\r")
+    for _ in range(3):
+        stripped = _NAME_INTRO_PREFIX_PATTERN.sub("", name, count=1).strip()
+        if stripped == name:
+            break
+        name = stripped
+    return name.rstrip(_NAME_SUFFIX_PARTICLES).strip()
+
+
+def _looks_like_name_refusal(text: str) -> bool:
+    """判断是否为 LLM 拒答/解释性长句，而非纯姓名输出。"""
+    if _SENTENCE_PUNCT_PATTERN.search(text):
+        return True
+    if any(keyword in text for keyword in _EXTRACT_NAME_REFUSAL_KEYWORDS):
+        return True
+    if len(re.findall(r"[\u4e00-\u9fff]", text)) > 4:
+        return True
+    return False
 
 
 def sanitize_extracted_name(raw: str | None) -> str:
     """
-    清洗 LLM 姓名抽取结果：仅保留 2–4 个连续汉字的人名，否则返回空字符串。
+    清洗 LLM 姓名抽取结果：仅当输出为（或剥离前后缀后为）2–4 个连续汉字人名时返回；
+    拒答句、解释句、问候语等均返回空字符串。
     """
     if raw is None:
         return ""
@@ -237,17 +297,18 @@ def sanitize_extracted_name(raw: str | None) -> str:
     text = _LOCATION_TAG_PATTERN.sub("", text).strip()
     if text.lower() in _EXTRACT_NAME_EMPTY_TOKENS or text in _EXTRACT_NAME_EMPTY_TOKENS:
         return ""
-    # 去掉常见包裹符号
-    text = text.strip("「」『』\"' \t\n\r，。！？!?；;：:")
-    if not text or text.lower() in _EXTRACT_NAME_EMPTY_TOKENS:
+
+    if _looks_like_name_refusal(text):
         return ""
-    match = _CHINESE_NAME_PATTERN.search(text)
-    if not match:
+
+    name = _strip_name_affixes(text)
+    if not name or name.lower() in _EXTRACT_NAME_EMPTY_TOKENS or name in _EXTRACT_NAME_EMPTY_TOKENS:
         return ""
-    candidate = match.group(0)
-    if not is_concrete_person_name(candidate):
+    if not _VALID_NAME_PATTERN.fullmatch(name):
         return ""
-    return candidate
+    if not is_concrete_person_name(name):
+        return ""
+    return name
 
 
 def _build_active_ask_prompt(query: str, context: str) -> str:
