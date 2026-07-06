@@ -11,6 +11,8 @@ paths:
   logs_dir: "./RAG/logs" # RAG 运行时脚本日志（RAG/rag_api.py）
   doc_logs_dir: "./RAG/logs/doc" # 文档预处理日志（DP/document_processor.py）
   models_dir: "./RAG/assets/models" # HF 模型缓存（与 huggingface 段配合）
+  visitor_state_dir: "./RAG/assets/visitor_states" # 按 vision_user_id 独立维护的用户状态目录
+  visitor_state_file: "./RAG/assets/visitor_state.json" # 旧版单文件状态（首次启动时自动迁移）
 
 # 模型 ID：须与建库时一致，否则检索向量空间不匹配
 models:

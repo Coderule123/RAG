@@ -32,7 +32,55 @@ from .prompt_builder import (
 )
 from .reranker_service import RerankerService
 from .retriever_runtime import RetrieverRuntime
+from .tour_lang_rules import detect_completed_steps, steps_summary
 from .visitor_state import VisitorStateStore
+
+# ── 主动招呼阶段感知配置 ──────────────────────────────────────────────────────
+# step_id -> (检索用 tag, 检索语义词, 情境提示传给 LLM)
+# tag 与 data/ 下对应子目录名严格一致（DP 建库时按目录名打 tag）
+STAGE_ACTIVE_ASK_CONFIG: dict = {
+    "greeting": (
+        "active_ask_greeting",
+        "进店问候 欢迎顾客 第一次来店 首次拜访 展厅接待",
+        "顾客刚进入展厅，尚未开口，请主动问候并判断是否首次来访",
+    ),
+    "needs_exploration": (
+        "active_ask_needs",
+        "探寻需求 购车意向 用车场景 家庭用车 关注哪款车",
+        "已完成问候，需主动了解顾客用车场景、家庭情况与关注车型",
+    ),
+    "powertrain_range": (
+        "active_ask_power",
+        "续航介绍 增程技术 充电 使用成本 引导讲解动力",
+        "需求已了解，主动引导顾客关注动力续航与使用成本亮点",
+    ),
+    "exterior_chassis": (
+        "active_ask_exterior",
+        "车外讲解 底盘 后轮转向 安全 引导走到展车旁边",
+        "动力讲完，带顾客走到展车旁，主动引导观察底盘与安全配置",
+    ),
+    "driver_cockpit": (
+        "active_ask_cockpit",
+        "引导上车 主驾体验 大屏幕 座舱介绍 雨夜模式",
+        "车外讲完，引导顾客坐进主驾，主动介绍座舱与智能功能",
+    ),
+    "copilot_rear": (
+        "active_ask_rear",
+        "副驾 后排空间 冰箱 零重力 贵妃椅 后备箱",
+        "主驾体验完毕，带顾客移步副驾和后排，主动介绍舒适与家用配置",
+    ),
+    "test_drive": (
+        "active_ask_testdrive",
+        "邀请试驾 安排试驾 亲自体验驾驶 感受上路",
+        "产品介绍已完成，主动邀请顾客安排试驾体验",
+    ),
+    "purchase_intent": (
+        "active_ask_purchase",
+        "价格 优惠 金融方案 下订 购买意向 交付周期",
+        "试驾结束，主动引导顾客进入价格与购买意向沟通",
+    ),
+}
+# ─────────────────────────────────────────────────────────────────────────────
 
 CURRENT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = CURRENT_DIR.parent
@@ -94,8 +142,15 @@ class RAGService:
         hf_runtime = setup_huggingface_env(self.config)
         print("RAGService HF 运行配置: ", hf_runtime)
 
-        state_file = paths.get("visitor_state_file", "./RAG/assets/visitor_state.json")
-        self.visitor_state = VisitorStateStore(state_file)
+        state_dir = paths.get("visitor_state_dir", "./RAG/assets/visitor_states")
+        legacy_state_file = paths.get(
+            "visitor_state_file", "./RAG/assets/visitor_state.json"
+        )
+        self.visitor_state = VisitorStateStore(
+            state_dir=state_dir,
+            legacy_file=legacy_state_file,
+        )
+        logger.info("用户状态目录: %s", state_dir)
 
         # 每个实例维护自己的 second 标志，初始化为 False
         self.second = False
@@ -267,6 +322,15 @@ class RAGService:
         if is_obtain_name and is_active_ask:
             raise ValueError("is_obtain_name 与 is_active_ask 不能同时为 True")
 
+        vid_for_log = (vision_user_id or "").strip() or None
+        logger.info(
+            "query 入参 vision_user_id=%s voice_user_id=%s is_active_ask=%s is_obtain_name=%s",
+            vid_for_log,
+            (voice_user_id or "").strip() or None,
+            is_active_ask,
+            is_obtain_name,
+        )
+
         raw_query = (query or "").strip()
         if not raw_query and not is_active_ask:
             raise ValueError("query 不能为空")
@@ -291,9 +355,29 @@ class RAGService:
         )
 
         # ── tag 解析 ─────────────────────────────────────────────────────────
+        active_ask_stage_hint: str = ""
         if is_active_ask:
-            resolved_tags = [str(active_ask_tag).lower()]
-            retrieve_query = raw_query or default_active_ask_query
+            # 阶段感知：若有用户 ID，根据当前导购阶段选择专属 tag 与检索词
+            stage_tag = str(active_ask_tag).lower()
+            stage_query = raw_query or default_active_ask_query
+            if vid:
+                next_step = self.visitor_state.get_next_pending_step(vid)
+                if next_step:
+                    step_id = next_step["id"]
+                    cfg = STAGE_ACTIVE_ASK_CONFIG.get(step_id)
+                    if cfg:
+                        stage_tag, stage_query_tmpl, active_ask_stage_hint = cfg
+                        stage_query = raw_query or stage_query_tmpl
+                        logger.info(
+                            "主动招呼阶段感知: step_id=%s tag=%s hint=%s",
+                            step_id, stage_tag, active_ask_stage_hint,
+                        )
+                    else:
+                        logger.info("主动招呼阶段感知: step_id=%s 无对应配置，使用通用 tag", step_id)
+                else:
+                    logger.info("主动招呼：用户 %s 全部阶段已完成，使用通用兜底", vid)
+            resolved_tags = [stage_tag]
+            retrieve_query = stage_query
             logger.info(
                 "主动招呼模式: tag=%s retrieve_query=%s",
                 resolved_tags,
@@ -350,8 +434,18 @@ class RAGService:
             resolved_tags = resolved_tags + [_GENERAL_TAG]
             logger.info("叠加 general tag，最终检索 tag: %s", resolved_tags)
 
-        # 提前计算 vid，供 user_id 切换检测使用
+        # 提前计算 vid，供 user_id 切换检测与按用户状态文件使用
         vid = (vision_user_id or "").strip() or None
+        user_state: Optional[Dict[str, Any]] = None
+        if vid:
+            user_state = self.visitor_state.get_or_create(vid)
+            logger.info(
+                "用户状态: vision_user_id=%s file=%s %s ask_name=%s",
+                vid,
+                self.visitor_state.get_state_file_path(vid),
+                self.visitor_state.get_tour_progress_summary(vid),
+                user_state.get("ask_name"),
+            )
 
         # 如果调用方明确要求这是提取姓名的请求，重置实例级 second 为 False
         if is_obtain_name:
@@ -430,8 +524,19 @@ class RAGService:
                         self.second_ask = True
                         self._pending_name_user_id = vid
             else:
-                # 传入的是人名，直接传递给 prompt，状态文件不处理
+                # 传入的是人名，直接传递给 prompt，并写入用户状态
                 should_ask_name = False
+                self.visitor_state.set_person_name(vid, vid)
+
+        if vid and is_active_ask and not is_obtain_name:
+            advanced_step = self.visitor_state.mark_next_tour_step(vid)
+            if advanced_step:
+                logger.info(
+                    "主动招呼推进观车流程: vision_user_id=%s step_id=%s",
+                    vid,
+                    advanced_step,
+                )
+            user_state = self.visitor_state.get_or_create(vid)
 
         prompt = build_prompt(
             raw_query,
@@ -442,11 +547,27 @@ class RAGService:
             should_ask_name=should_ask_name,
             is_obtain_name=is_obtain_name,
             is_active_ask=is_active_ask,
+            active_ask_stage_hint=active_ask_stage_hint,
         )
         timings["build_context_prompt"] = time.perf_counter() - t2
         timings["total"] = (
             timings["retrieve"] + timings["rerank"] + timings["build_context_prompt"]
         )
+
+        # ── 语言规则库：根据本轮 query 自动标记已完成的观车环节 ──────────────
+        auto_steps: List[str] = []
+        if vid and not is_obtain_name:
+            auto_steps = detect_completed_steps(query=raw_query, response="")
+            if auto_steps:
+                for step_id in auto_steps:
+                    self.visitor_state.mark_tour_step_asked(vid, step_id)
+                user_state = self.visitor_state.get_or_create(vid)
+                logger.info(
+                    "语言规则自动标记: vision_user_id=%s 命中环节=[%s]",
+                    vid,
+                    steps_summary(auto_steps),
+                )
+        # ─────────────────────────────────────────────────────────────────────
 
         result = {
             "query": raw_query,
@@ -459,6 +580,9 @@ class RAGService:
             "second": self.second,
             "active_tags": resolved_tags,
             "is_active_ask": is_active_ask,
+            "vision_user_id": vid,
+            "visitor_state": user_state,
+            "auto_matched_steps": auto_steps,
         }
         if verbose:
             self._print_result(result)

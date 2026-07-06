@@ -313,13 +313,12 @@ def sanitize_extracted_name(raw: str | None) -> str:
     return name
 
 
-def _build_active_ask_prompt(query: str, context: str) -> str:
+def _build_active_ask_prompt(query: str, context: str, stage_hint: str = "") -> str:
     """
     构建「主动询问顾客」专用提示词。
 
-    场景：尚未收到顾客有效对话，由机器人先开口。
-    模型需根据【主动招呼资料】生成一句自然、口语化的开场或引导语，
-    不得输出 <INTENT>、<LOCATION> 等标签，也不得在正文中暴露资料分类名或 tag。
+    场景：顾客无有效对话时由机器人先开口，或机器人主动推进导购流程。
+    stage_hint 由 RAGService 根据用户当前导购阶段注入，告知模型本轮应推进到哪个环节。
     """
     hint = (query or "").strip()
     hint_block = ""
@@ -329,40 +328,48 @@ def _build_active_ask_prompt(query: str, context: str) -> str:
             "（仅供你把握语气与侧重点，勿当作顾客已提出的问题，也不要逐字复述。）\n"
         )
 
+    stage_block = ""
+    if stage_hint:
+        stage_block = (
+            f"\n【当前导购阶段目标】\n{stage_hint}\n"
+            "请你围绕上述阶段目标，生成符合该阶段的主动引导语，"
+            "自然地推动对话向下一步进展，不要跳跃到尚未触及的阶段。\n"
+        )
+
     context_block = (context or "").strip()
     if not context_block:
-        context_block = "（暂无检索到话术资料，请用简短、礼貌的通用展厅问候开场。）"
+        context_block = "（暂无检索到对应话术资料，请结合阶段目标用简短自然的口语开场。）"
 
     template = (
-        "【最高优先级 — 主动招呼（非应答模式）】\n"
-        "当前没有收到顾客的有效提问或对话内容。\n"
-        "你的唯一任务是：作为展厅智能导购助手小特，主动向面前的顾客说一句话**，"
-        "自然、礼貌地开口，吸引对方愿意继续交流。\n"
-        "\n"
-        "【任务性质】\n"
-        "这是一次「机器人主动发起对话」的生成任务，不是回答顾客问题，"
-        "也不是介绍具体车型参数。请像真人导购路过时随口招呼一样表达。\n"
+        "【最高优先级 — 主动发起对话（导购推进模式）】\n"
+        "当前没有收到顾客的有效提问，由你主动开口。\n"
+        "你的角色是展厅智能导购助手小特，像一位真人专业导购一样，"
+        "自然、礼貌地引导顾客进入下一个体验环节。\n"
         "\n"
         "【输出要求 — 必须全部遵守】\n"
-        "1. 直接输出面向顾客的一句或两句中文口语，不要输出 <INTENT>、<LOCATION> 等任何标签"
-        "（本段要求覆盖默认系统提示中的状态标签规则）。\n"
-        "2. 可结合【主动招呼资料】中的话术风格与要点，但必须改写为自然口语，"
-        "禁止照搬资料原文、禁止罗列条目、禁止像念稿。\n"
-        "3. 禁止在回复中出现资料分类名、文件夹名、tag 名（如 active_ask、general、ls6 等）"
+        "1. 直接输出面向顾客的一句或两句中文口语，禁止输出 <INTENT>、<LOCATION> 等任何标签。\n"
+        "2. 必须结合【当前导购阶段目标】，让话语有明确的引导方向，而不是泛泛问候。\n"
+        "3. 可参考【主动话术资料】中的风格与范例，但必须改写为自然口语，"
+        "禁止照搬原文、禁止罗列条目、禁止像念稿。\n"
+        "4. 禁止在回复中出现资料分类名、文件夹名、tag 名（如 active_ask、ls6 等）"
         "及「根据资料」「检索」等系统用语。\n"
-        "4. 不要假设顾客姓名；不要询问「怎么称呼」——若需问称呼，应使用资料中已有的"
-        "主动招呼话术风格，且勿与「询问姓名专用流程」混用。\n"
-        "5. 不要回答未提出的业务问题；不要编造价格、配置、政策。\n"
-        "6. 控制在 80 字以内，语气亲切、不压迫、不过度推销。\n"
-        "7. 可根据历史对话记录合理推测顾客的兴趣和需求，并结合【主动招呼资料】中的话术风格与要点，自然、礼貌地开口，吸引对方愿意继续交流。\n"
+        "5. 若已知顾客姓名，可适当使用（如「张先生」），语气亲切自然；"
+        "未知姓名则不要臆造称呼，也不要重复询问。\n"
+        "6. 不要编造未经核实的价格、配置或政策数据。\n"
+        "7. 控制在 80 字以内，亲切自然，不压迫，不过度推销。\n"
+        "{stage_block}"
         "{hint_block}"
         "\n"
-        "【主动招呼资料】\n"
+        "【主动话术资料】\n"
         "{context}\n"
         "\n"
-        "请直接输出你对顾客说的主动招呼语："
+        "请直接输出你对顾客说的引导语："
     )
-    return template.format(hint_block=hint_block, context=context_block)
+    return template.format(
+        stage_block=stage_block,
+        hint_block=hint_block,
+        context=context_block,
+    )
 
 
 def _build_obtain_name_prompt(query: str) -> str:
@@ -430,6 +437,7 @@ def build_prompt(
     should_ask_name: bool = False,
     is_obtain_name: bool = False,
     is_active_ask: bool = False,
+    active_ask_stage_hint: str = "",
 ) -> str:
     """
     组装 RAG 提示词字符串，融合访客身份、意图状态与导航地点指令。
@@ -445,8 +453,8 @@ def build_prompt(
         return _build_obtain_name_prompt(query)
 
     if is_active_ask:
-        logger.info("构建主动招呼专用 prompt")
-        return _build_active_ask_prompt(query, context)
+        logger.info("构建主动招呼专用 prompt stage_hint=%s", active_ask_stage_hint or "(无)")
+        return _build_active_ask_prompt(query, context, stage_hint=active_ask_stage_hint)
 
     # 首次见面需询问姓名时，使用专用 prompt，避免与 RAG 作答指令及默认 INTENT 规则冲突。
     if should_ask_name:
