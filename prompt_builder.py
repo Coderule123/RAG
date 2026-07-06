@@ -92,10 +92,12 @@ def resolve_pending_navigation_tags(
     default_tag: str = "ls6",
 ) -> Optional[List[str]]:
     """
-    参观意向时计算「下轮检索」应使用的 tag 列表；非参观意向返回 None。
+    参观意向时计算应固定到检索范围的 tag 列表；非参观意向返回 None。
 
     - 命中预设地点：tag 为命中的地点（多个地点则多个 tag）
     - 未命中地点：tag 为 default_tag（导航默认展区，如 ls6）
+
+    由 RAGService 在本轮立即写入 _pinned_navigation_tags，直到下次参观意向覆盖。
     """
     if not is_visit_intent_query(query):
         return None
@@ -334,7 +336,7 @@ def _build_active_ask_prompt(query: str, context: str) -> str:
     template = (
         "【最高优先级 — 主动招呼（非应答模式）】\n"
         "当前没有收到顾客的有效提问或对话内容。\n"
-        "你的唯一任务是：作为展厅智能导购，主动向面前的顾客说一句话**，"
+        "你的唯一任务是：作为展厅智能导购助手小特，主动向面前的顾客说一句话**，"
         "自然、礼貌地开口，吸引对方愿意继续交流。\n"
         "\n"
         "【任务性质】\n"
@@ -460,7 +462,7 @@ def build_prompt(
         logger.info("参观意向已识别地点: %s", detected_location)
 
     base_instruction = (
-        "基于【资料】回答问题。如果资料不足以回答问题，请明确回复“抱歉，我无法回答你的问题”。不要自己编造答案。优先以【资料】中的内容回答问题，如果【资料】中的内容不足以回答问题，则根据历史对话记录合理推测每次问题的主语，并结合【资料】中的内容回答问题。\n"
+        "基于【资料】回答问题。如果资料不足以回答问题，不要自己编造答案。优先以【资料】中的内容回答问题，如果【资料】中的内容不足以回答问题，则根据历史对话记录合理推测每次问题的主语，并结合【资料】中的内容回答问题。\n"
     )
 
     if detected_location:
@@ -476,7 +478,7 @@ def build_prompt(
     )
 
     template = (
-        "你是一个智能导购助手。请严格遵循以下要求：\n"
+        "你是一个智能导购助手，你的名字叫小特。请严格遵循以下要求：\n"
         "{base_instruction}\n"
         "\n"
         "{user_line}\n"

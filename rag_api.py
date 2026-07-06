@@ -105,8 +105,8 @@ class RAGService:
 
         # tag 检索状态：_active_tags 跨 query() 调用持久保存，实现「沿用上次 tag」
         self._active_tags: List[str] = []
-        # 参观意向下轮生效的 tag（本轮仅写入，下轮 query 开始时消费）
-        self._pending_navigation_tags: Optional[List[str]] = None
+        # 参观意向固定 tag：输出 LOCATION 时写入，下次参观意向前不被 query 解析覆盖，仅叠加
+        self._pinned_navigation_tags: List[str] = []
         self._known_tags: List[str] = self._load_known_tags()
         self._tag_pattern: Optional[re.Pattern] = self._build_tag_pattern(self._known_tags)
         logger.info("已知 tag: %s", self._known_tags)
@@ -190,6 +190,19 @@ class RAGService:
         found = {m.group(1).lower() for m in self._tag_pattern.finditer(query)}
         return [t for t in self._known_tags if t in found]
 
+    @staticmethod
+    def _merge_tags(*tag_lists: List[str]) -> List[str]:
+        """合并多个 tag 列表，去重并保持先出现的顺序（固定参观 tag 优先）。"""
+        merged: List[str] = []
+        seen: set = set()
+        for tags in tag_lists:
+            for tag in tags:
+                normalized = (tag or "").strip().lower()
+                if normalized and normalized not in seen:
+                    seen.add(normalized)
+                    merged.append(normalized)
+        return merged
+
     def _print_result(self, result: Dict[str, Any]) -> None:
         """打印 RAG 结果的详细信息（日志+控制台），与原有 print_rag_result 功能一致"""
         logger.info("检索耗时: %.4fs", result["timings"]["retrieve"])
@@ -243,13 +256,13 @@ class RAGService:
 
         tag：指定检索范围的 tag 列表（对应 metadata.tag 字段，如 ["ls6", "ls7"]）。
           - 显式传入非 None 列表：直接使用并更新实例 _active_tags。
-          - 传入 None（默认）：先从 query 正则解析 tag；解析到则更新并使用，
-            否则沿用实例 _active_tags（跨调用持久化）。
-          - 传入空列表 []：清除历史 tag 与参观导航预设，本次全库检索。
+          - 传入 None（默认）：先从 query 正则解析 tag；解析到则与固定参观 tag 叠加，
+            否则沿用实例 _active_tags（跨调用持久化，且始终包含固定参观 tag）。
+          - 传入空列表 []：清除历史 tag 与固定参观 tag，本次全库检索。
           - is_active_ask=True 时忽略上述规则，固定检索 active_ask，且不改写 _active_tags。
-          - 参观意向：未命中预设地点时不输出 LOCATION（见 prompt_builder），并预设下轮 tag
-            为 default_navigation_tag；命中地点则预设下轮 tag 为命中值。预设 tag 在本轮不生效，
-            仅在下一次 query() 开始时写入 _active_tags。
+          - 参观意向：命中预设地点时固定对应 tag；未命中时使用 default_navigation_tag。
+            固定 tag 在本轮立即生效，直到下一次参观意向才被覆盖；期间 query 解析到的
+            其他车型 tag 仅叠加，不替换固定 tag。
         """
         if is_obtain_name and is_active_ask:
             raise ValueError("is_obtain_name 与 is_active_ask 不能同时为 True")
@@ -289,30 +302,29 @@ class RAGService:
         else:
             retrieve_query = raw_query
             visit_locations = self.config.get("visit_locations")
+            detected = self._detect_tags_from_query(raw_query)
 
             if tag is not None:
                 resolved_tags = [t.lower() for t in tag if t]
                 self._active_tags = resolved_tags
                 if not resolved_tags:
-                    self._pending_navigation_tags = None
+                    self._pinned_navigation_tags = []
                 logger.info("tag 来源=显式传入: %s", resolved_tags)
             else:
-                if self._pending_navigation_tags is not None:
-                    self._active_tags = list(self._pending_navigation_tags)
-                    self._pending_navigation_tags = None
-                    logger.info(
-                        "tag 来源=上轮参观意向预设: %s", self._active_tags
-                    )
-
-                detected = self._detect_tags_from_query(raw_query)
                 if detected:
-                    resolved_tags = detected
+                    resolved_tags = self._merge_tags(
+                        self._pinned_navigation_tags, detected
+                    )
                     self._active_tags = resolved_tags
-                    logger.info("tag 来源=query 解析: %s", resolved_tags)
-                else:
-                    resolved_tags = self._active_tags
                     logger.info(
-                        "tag 来源=沿用历史: %s",
+                        "tag 来源=query 解析(含固定参观): %s", resolved_tags
+                    )
+                else:
+                    resolved_tags = self._merge_tags(
+                        self._pinned_navigation_tags, self._active_tags
+                    )
+                    logger.info(
+                        "tag 来源=沿用历史(含固定参观): %s",
                         resolved_tags if resolved_tags else "无（全库检索）",
                     )
 
@@ -323,8 +335,12 @@ class RAGService:
                     self.default_navigation_tag,
                 )
                 if nav_tags is not None:
-                    self._pending_navigation_tags = nav_tags
-                    logger.info("参观意向已记录，下轮 tag 预设: %s", nav_tags)
+                    self._pinned_navigation_tags = list(nav_tags)
+                    resolved_tags = self._merge_tags(nav_tags, detected)
+                    self._active_tags = resolved_tags
+                    logger.info(
+                        "参观意向已固定 tag: %s", self._pinned_navigation_tags
+                    )
         # ─────────────────────────────────────────────────────────────────────
 
         # 叠加 general tag：有具体车型 tag 时同步检索通用知识库（品牌介绍、通用 FAQ 等）。

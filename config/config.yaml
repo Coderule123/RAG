@@ -5,46 +5,48 @@
 
 # 目录：知识库、向量索引、模型缓存、日志
 paths:
-  data_dir: "./RAG/assets/data"                 # 待入库文档根目录（DP 读取）
+  data_dir: "./RAG/assets/data" # 待入库文档根目录（DP 读取）
   # 向量库根目录：内含 faiss_store/、metadata/（按文档文件名的分块元数据）、doc_hash.json、chunks.db
   index_dir: "./RAG/assets/index_store"
-  logs_dir: "./RAG/logs"                        # RAG 运行时脚本日志（RAG/rag_api.py）
-  doc_logs_dir: "./RAG/logs/doc"                # 文档预处理日志（DP/document_processor.py）
-  models_dir: "./RAG/assets/models"             # HF 模型缓存（与 huggingface 段配合）
+  logs_dir: "./RAG/logs" # RAG 运行时脚本日志（RAG/rag_api.py）
+  doc_logs_dir: "./RAG/logs/doc" # 文档预处理日志（DP/document_processor.py）
+  models_dir: "./RAG/assets/models" # HF 模型缓存（与 huggingface 段配合）
 
 # 模型 ID：须与建库时一致，否则检索向量空间不匹配
 models:
-  embedding_model: "BAAI/bge-small-zh-v1.5"   # 查询向量与 FAISS 建库用同一套
-  reranker_model: "BAAI/bge-reranker-v2-m3"   # CrossEncoder 精排
+  embedding_model: "BAAI/bge-small-zh-v1.5" # 查询向量与 FAISS 建库用同一套
+  reranker_model: "BAAI/bge-reranker-v2-m3" # CrossEncoder 精排
 
 # 检索与重排（RAG/rag_api.py 可用 CLI 覆盖）
 retrieval:
-  top_k: 8              # 向量召回条数
-  rerank_top_n: 8       # 重排后保留条数
-  use_reranker: false   # 是否启用重排，设为 false 则跳过重排步骤
-  vector_threshold: 0.3  # 向量分数阈值（普通对话）
-  active_ask_vector_threshold: 0.0  # 主动招呼模式专用阈值：tag 已收窄至 active_ask，无需额外过滤
-  ask_name_reask_timeout_sec: 18000  # 姓名重问阈值：距离首次询问超过该秒数将再次询问
-  active_ask_tag: active_ask        # 主动招呼模式固定检索的 metadata.tag（对应 data/active_ask/）
-  active_ask_retrieval_query: "展厅主动招呼 欢迎语 引导顾客交流 开口话术 接待用语"  # query 为空时用于向量检索
-  default_navigation_tag: ls6       # 参观意向但未命中预设地点时，下轮检索使用的默认 tag
+  top_k: 8 # 向量召回条数
+  rerank_top_n: 8 # 重排后保留条数
+  use_reranker: false # 是否启用重排，设为 false 则跳过重排步骤
+  vector_threshold: 0.3 # 向量分数阈值（普通对话）
+  active_ask_vector_threshold: 0.0 # 主动招呼模式专用阈值：tag 已收窄至 active_ask，无需额外过滤
+  ask_name_reask_timeout_sec: 18000 # 姓名重问阈值：距离首次询问超过该秒数将再次询问
+  active_ask_tag: active_ask # 主动招呼模式固定检索的 metadata.tag（对应 data/active_ask/）
+  active_ask_retrieval_query: "展厅主动招呼 欢迎语 引导顾客交流 开口话术 接待用语" # query 为空时用于向量检索
+  default_navigation_tag: ls6 # 参观意向但未命中预设地点时，下轮检索使用的默认 tag
 
 # 展厅可导航地点（参观意向问题中匹配后写入 <LOCATION> 标签）
 visit_locations:
   - "l6"
   - "ls6"
   - "ls7"
+  - "ls8"
+  - "ls9"
 
 # 切分与入库（DP/document_processor.py）
 vector_index:
   chunk_size: 500
   overlap: 80
-  batch_size: 128       # 预留：当前入库为整批 add_documents，可按需改批处理
-  incremental: true     # true：在已有 faiss_store 上追加；false：全量重建
+  batch_size: 128 # 预留：当前入库为整批 add_documents，可按需改批处理
+  incremental: true # true：在已有 faiss_store 上追加；false：全量重建
 
 # Hugging Face：镜像、缓存目录、离线
 huggingface:
   mirror_enabled: true
   endpoint: "https://hf-mirror.com"
-  local_files_only: true    # 仅本地模型（需事先把模型放到 assets/models 下）
-  offline_mode: true       # true 时强制 HF_HUB_OFFLINE，完全禁止联网
+  local_files_only: true # 仅本地模型（需事先把模型放到 assets/models 下）
+  offline_mode: true # true 时强制 HF_HUB_OFFLINE，完全禁止联网
