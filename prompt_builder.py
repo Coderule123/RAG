@@ -130,23 +130,25 @@ def is_concrete_person_name(user_id: Optional[str]) -> bool:
 def _build_user_context_lines(
     vision_user_id: Optional[str],
     should_ask_name: bool,
+    vision_user_name: Optional[str] = None,
 ) -> str:
-    """根据传入的 vision_user_id 推断访客身份并生成提示行。
+    """根据 vision_user_id（uuid）与 vision_user_name 生成访客身份提示行。"""
+    display_id = (
+        str(vision_user_id).strip()
+        if vision_user_id is not None and str(vision_user_id).strip()
+        else None
+    )
+    known_name = None
+    if vision_user_name and str(vision_user_name).strip():
+        name = str(vision_user_name).strip()
+        if is_concrete_person_name(name):
+            known_name = name
 
-    仅使用传入的 `vision_user_id` 作为识别来源：
-    - 如果该 id 包含中文字符且非时间戳，视为人名；
-    - 否则视为访客标识（如时间戳或编号）。
-    """
-    display_id = str(vision_user_id).strip() if vision_user_id is not None and str(vision_user_id).strip() else None
-    is_name = is_concrete_person_name(vision_user_id)
-    source = "视觉识别" if display_id else None
-    final_name = display_id if is_name and display_id else ""
-
-    if final_name:
-        logger.info("已识别具体人名 (%s): %s", source or "视觉识别", final_name)
+    if known_name:
+        logger.info("已识别具体人名 (视觉识别): %s", known_name)
         return (
             "【访客身份】\n"
-            f"当前已知用户姓名是：{final_name}。请在回答中适时、礼貌地使用对方姓名（如「{final_name}」），语气亲切自然；"
+            f"当前已知用户姓名是：{known_name}。请在回答中适时、礼貌地使用对方姓名（如「{known_name}」），语气亲切自然；"
             "不必每句话都重复姓名，避免生硬。\n"
         )
 
@@ -433,6 +435,7 @@ def build_prompt(
     context: str,
     vision_user_id: Optional[str] = None,
     voice_user_id: Optional[str] = None,
+    vision_user_name: Optional[str] = None,
     visit_locations: Optional[List[str]] = None,
     should_ask_name: bool = False,
     is_obtain_name: bool = False,
@@ -444,7 +447,7 @@ def build_prompt(
 
     要求模型：
     1. 基于【资料】回答问题，资料不足则说明“资料不足”。
-    2. 仅根据 vision_user_id 与状态参数调整称呼策略（voice_user_id 暂不处理）。
+    2. 根据 vision_user_id（uuid）与 vision_user_name 调整称呼策略（voice_user_id 暂不处理）。
     3. 根据用户问题判断意图状态，并在回答末尾附加 <INTENT>状态</INTENT>。
     4. 参观意向且含具体地点时，在 <INTENT> 后附加 <LOCATION>地点</LOCATION>。
     """
@@ -464,6 +467,7 @@ def build_prompt(
     user_line = _build_user_context_lines(
         vision_user_id=vision_user_id,
         should_ask_name=should_ask_name,
+        vision_user_name=vision_user_name,
     )
     intent_line, detected_location = _build_intent_instruction_lines(query, visit_locations)
     if detected_location:

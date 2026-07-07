@@ -297,6 +297,7 @@ class RAGService:
         top_k: Optional[int] = None,
         rerank_top_n: Optional[int] = None,
         vision_user_id: Optional[str] = None,
+        vision_user_name: Optional[str] = None,
         voice_user_id: Optional[str] = None,
         verbose: bool = True,
         is_obtain_name: bool = False,
@@ -323,9 +324,11 @@ class RAGService:
             raise ValueError("is_obtain_name 与 is_active_ask 不能同时为 True")
 
         vid_for_log = (vision_user_id or "").strip() or None
+        name_for_log = (vision_user_name or "").strip() or None
         logger.info(
-            "query 入参 vision_user_id=%s voice_user_id=%s is_active_ask=%s is_obtain_name=%s",
+            "query 入参 vision_user_id=%s vision_user_name=%s voice_user_id=%s is_active_ask=%s is_obtain_name=%s",
             vid_for_log,
+            name_for_log,
             (voice_user_id or "").strip() or None,
             is_active_ask,
             is_obtain_name,
@@ -434,17 +437,24 @@ class RAGService:
             resolved_tags = resolved_tags + [_GENERAL_TAG]
             logger.info("叠加 general tag，最终检索 tag: %s", resolved_tags)
 
-        # 提前计算 vid，供 user_id 切换检测与按用户状态文件使用
+        # 提前计算 vid（uuid 状态键）与传入姓名，供用户状态与询问姓名逻辑使用
         vid = (vision_user_id or "").strip() or None
+        incoming_name = (vision_user_name or "").strip() or None
+        # 兼容 CLI：仅传入人名作为 vision_user_id 时，视为人名
+        if vid and not incoming_name and is_concrete_person_name(vid):
+            incoming_name = vid
+
         user_state: Optional[Dict[str, Any]] = None
         if vid:
             user_state = self.visitor_state.get_or_create(vid)
             logger.info(
-                "用户状态: vision_user_id=%s file=%s %s ask_name=%s",
+                "用户状态: vision_user_id=%s vision_user_name=%s file=%s %s ask_name=%s person_name=%s",
                 vid,
+                incoming_name,
                 self.visitor_state.get_state_file_path(vid),
                 self.visitor_state.get_tour_progress_summary(vid),
                 user_state.get("ask_name"),
+                user_state.get("person_name"),
             )
 
         # 如果调用方明确要求这是提取姓名的请求，重置实例级 second 为 False
@@ -504,29 +514,32 @@ class RAGService:
         t2 = time.perf_counter()
         visit_locations = self.config.get("visit_locations")
 
-        # 新传入的数字 id（非人名）且尚无状态 -> 需要询问姓名一次
+        # 以 uuid 管理用户状态；有姓名则写入，无姓名则走询问姓名逻辑
+        resolved_name: Optional[str] = None
         if not is_obtain_name and vid:
-            if not is_concrete_person_name(vid):
-                # 数字 id / 匿名 id 路径：查询状态文件
-                state = self.visitor_state.get(vid)
+            if incoming_name and is_concrete_person_name(incoming_name):
+                resolved_name = incoming_name
+                self.visitor_state.set_person_name(vid, incoming_name)
+
+            state = self.visitor_state.get(vid)
+            if not resolved_name and state and state.get("person_name"):
+                resolved_name = str(state["person_name"]).strip() or None
+
+            if resolved_name:
+                should_ask_name = False
+            else:
                 if state is None:
-                    # 新 id：需要询问姓名一次，并记录到状态文件
                     should_ask_name = True
                     self.second_ask = True
                     self._pending_name_user_id = vid
                     self.visitor_state.mark_asked(vid)
                 else:
-                    # 旧 id：若距离首次询问超过阈值，则重新询问一次
                     should_ask_name = self.visitor_state.should_reask(
                         vid, self.ask_name_reask_timeout_sec
                     )
                     if should_ask_name:
                         self.second_ask = True
                         self._pending_name_user_id = vid
-            else:
-                # 传入的是人名，直接传递给 prompt，并写入用户状态
-                should_ask_name = False
-                self.visitor_state.set_person_name(vid, vid)
 
         if vid and is_active_ask and not is_obtain_name:
             advanced_step = self.visitor_state.mark_next_tour_step(vid)
@@ -542,6 +555,7 @@ class RAGService:
             raw_query,
             context,
             vision_user_id=vision_user_id,
+            vision_user_name=resolved_name,
             voice_user_id=voice_user_id,
             visit_locations=visit_locations,
             should_ask_name=should_ask_name,
