@@ -170,6 +170,26 @@ def _build_user_context_lines(
         "也不要再次主动询问姓名。\n"
     )
 
+
+def _build_robot_location_lines(robot_location_tags: Optional[List[str]]) -> str:
+    """导航完成后，将机器人当前所在展车点位写入 prompt。"""
+    tags = [t.strip() for t in (robot_location_tags or []) if t and str(t).strip()]
+    if not tags:
+        return ""
+    if len(tags) == 1:
+        display = tags[0]
+        example = f"我现在旁边的车是{display}"
+    else:
+        display = "、".join(tags)
+        example = f"我现在旁边的车是{tags[0]}"
+    logger.info("机器人位置提示: %s", display)
+    return (
+        "【机器人位置】\n"
+        f"机器人已完成导航，当前所在展车旁，旁边的车是 {display}。"
+        f"回答时可自然引用当前位置，例如「{example}」。\n"
+    )
+
+
 def _build_ask_name_prompt(query: str) -> str:
     """
     构建首次询问访客姓名的专用提示词。
@@ -441,6 +461,7 @@ def build_prompt(
     is_obtain_name: bool = False,
     is_active_ask: bool = False,
     active_ask_stage_hint: str = "",
+    robot_location_tags: Optional[List[str]] = None,
 ) -> str:
     """
     组装 RAG 提示词字符串，融合访客身份、意图状态与导航地点指令。
@@ -469,6 +490,7 @@ def build_prompt(
         should_ask_name=should_ask_name,
         vision_user_name=vision_user_name,
     )
+    robot_location_line = _build_robot_location_lines(robot_location_tags)
     intent_line, detected_location = _build_intent_instruction_lines(query, visit_locations)
     if detected_location:
         logger.info("参观意向已识别地点: %s", detected_location)
@@ -494,6 +516,7 @@ def build_prompt(
         "{base_instruction}\n"
         "\n"
         "{user_line}\n"
+        "{robot_location_line}\n"
         "{intent_line}\n"
         "【资料】\n"
         "{context}\n"
@@ -507,6 +530,7 @@ def build_prompt(
     return prompt.format(
         base_instruction=base_instruction,
         user_line=user_line,
+        robot_location_line=robot_location_line,
         intent_line=intent_line,
         context=context,
         question=query,

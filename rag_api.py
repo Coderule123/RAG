@@ -258,6 +258,42 @@ class RAGService:
                     merged.append(normalized)
         return merged
 
+    _EXCLUDED_ROBOT_LOCATION_TAGS = frozenset({"general"})
+    _EXCLUDED_ROBOT_LOCATION_PREFIXES = ("active_ask",)
+
+    def _filter_vehicle_location_tags(self, tags: List[str]) -> List[str]:
+        """从导航固定 tag 中筛出可写入机器人位置提示的展车点位（如 ls6、l6）。"""
+        result: List[str] = []
+        for tag in tags:
+            normalized = (tag or "").strip().lower()
+            if not normalized or normalized in self._EXCLUDED_ROBOT_LOCATION_TAGS:
+                continue
+            if any(normalized.startswith(prefix) for prefix in self._EXCLUDED_ROBOT_LOCATION_PREFIXES):
+                continue
+            result.append(normalized)
+        return result
+
+    def commit_extracted_name(self, vision_user_id: str, person_name: str) -> bool:
+        """将姓名抽取结果写入用户状态，并重置实例级询问姓名标志。"""
+        vid = (vision_user_id or "").strip()
+        name = (person_name or "").strip()
+        if not vid or not name:
+            return False
+        if not is_concrete_person_name(name):
+            logger.info(
+                "抽取姓名无效，跳过写入: vision_user_id=%s raw=%r", vid, person_name
+            )
+            return False
+        self.visitor_state.set_person_name(vid, name)
+        if self._pending_name_user_id == vid:
+            self.second_ask = False
+            self.second = False
+            self._pending_name_user_id = None
+        logger.info(
+            "已写入抽取姓名: vision_user_id=%s person_name=%s", vid, name
+        )
+        return True
+
     def _print_result(self, result: Dict[str, Any]) -> None:
         """打印 RAG 结果的详细信息（日志+控制台），与原有 print_rag_result 功能一致"""
         logger.info("检索耗时: %.4fs", result["timings"]["retrieve"])
@@ -359,6 +395,7 @@ class RAGService:
 
         # ── tag 解析 ─────────────────────────────────────────────────────────
         active_ask_stage_hint: str = ""
+        is_navigation_turn = False
         if is_active_ask:
             # 阶段感知：若有用户 ID，根据当前导购阶段选择专属 tag 与检索词
             stage_tag = str(active_ask_tag).lower()
@@ -422,6 +459,7 @@ class RAGService:
                     self.default_navigation_tag,
                 )
                 if nav_tags is not None:
+                    is_navigation_turn = True
                     self._pinned_navigation_tags = list(nav_tags)
                     resolved_tags = self._merge_tags(nav_tags, detected)
                     self._active_tags = resolved_tags
@@ -551,6 +589,21 @@ class RAGService:
                 )
             user_state = self.visitor_state.get_or_create(vid)
 
+        robot_location_tags: List[str] = []
+        if (
+            not is_obtain_name
+            and not is_active_ask
+            and not is_navigation_turn
+            and self._pinned_navigation_tags
+        ):
+            robot_location_tags = self._filter_vehicle_location_tags(
+                self._pinned_navigation_tags
+            )
+            if robot_location_tags:
+                logger.info(
+                    "导航已完成，写入机器人位置: tags=%s", robot_location_tags
+                )
+
         prompt = build_prompt(
             raw_query,
             context,
@@ -562,6 +615,7 @@ class RAGService:
             is_obtain_name=is_obtain_name,
             is_active_ask=is_active_ask,
             active_ask_stage_hint=active_ask_stage_hint,
+            robot_location_tags=robot_location_tags,
         )
         timings["build_context_prompt"] = time.perf_counter() - t2
         timings["total"] = (
