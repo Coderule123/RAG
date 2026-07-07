@@ -26,6 +26,9 @@ from .context_builder import build_context
 from .prompt_builder import (
     ACTIVE_ASK_TAG,
     DEFAULT_ACTIVE_ASK_RETRIEVAL_QUERY,
+    DEFAULT_GREETING_LOCATION_LABEL,
+    GREETING_LOCATION_TAG,
+    MOVE_TO_WAIT_INTENT_PREFIX,
     build_prompt,
     is_concrete_person_name,
     resolve_pending_navigation_tags,
@@ -162,12 +165,22 @@ class RAGService:
         self._active_tags: List[str] = []
         # 参观意向固定 tag：输出 LOCATION 时写入，下次参观意向前不被 query 解析覆盖，仅叠加
         self._pinned_navigation_tags: List[str] = []
+        # 机器人当前所处位置（展车 tag 或 greeting=门口迎宾），跨轮次持久
+        retrieval_cfg = self.config.get("retrieval", {})
+        self.greeting_location_tag = str(
+            retrieval_cfg.get("greeting_location_tag", GREETING_LOCATION_TAG)
+        ).strip().lower() or GREETING_LOCATION_TAG
+        self.greeting_location_label = str(
+            retrieval_cfg.get(
+                "greeting_location_label", DEFAULT_GREETING_LOCATION_LABEL
+            )
+        ).strip() or DEFAULT_GREETING_LOCATION_LABEL
+        self._robot_location_tags: List[str] = [self.greeting_location_tag]
         self._known_tags: List[str] = self._load_known_tags()
         self._tag_pattern: Optional[re.Pattern] = self._build_tag_pattern(self._known_tags)
         logger.info("已知 tag: %s", self._known_tags)
 
         # 读取重排开关
-        retrieval_cfg = self.config.get("retrieval", {})
         self.default_navigation_tag = str(
             retrieval_cfg.get("default_navigation_tag", "ls6")
         ).lower()
@@ -294,6 +307,32 @@ class RAGService:
         )
         return True
 
+    def reset_robot_to_greeting_location(self) -> None:
+        """将机器人当前位置重置为门口迎宾，并清除导航检索状态。"""
+        self._pinned_navigation_tags = []
+        self._active_tags = []
+        self._robot_location_tags = [self.greeting_location_tag]
+        logger.info(
+            "机器人位置已重置为%s (tag=%s)",
+            self.greeting_location_label,
+            self.greeting_location_tag,
+        )
+
+    @staticmethod
+    def starts_with_move_to_wait(llm_text: str) -> bool:
+        """判断 LLM 回复最前端是否为 MOVE_TO_WAIT 意图。"""
+        return bool(MOVE_TO_WAIT_INTENT_PREFIX.match(llm_text or ""))
+
+    def handle_llm_response(self, llm_text: str) -> bool:
+        """
+        处理 LLM 回复文本。若最前端为 <INTENT>MOVE_TO_WAIT</INTENT>，
+        则将机器人位置重置为门口迎宾位置。
+        """
+        if not self.starts_with_move_to_wait(llm_text):
+            return False
+        self.reset_robot_to_greeting_location()
+        return True
+
     def _print_result(self, result: Dict[str, Any]) -> None:
         """打印 RAG 结果的详细信息（日志+控制台），与原有 print_rag_result 功能一致"""
         logger.info("检索耗时: %.4fs", result["timings"]["retrieve"])
@@ -359,12 +398,15 @@ class RAGService:
         if is_obtain_name and is_active_ask:
             raise ValueError("is_obtain_name 与 is_active_ask 不能同时为 True")
 
-        vid_for_log = (vision_user_id or "").strip() or None
-        name_for_log = (vision_user_name or "").strip() or None
+        vid = (vision_user_id or "").strip() or None
+        incoming_name = (vision_user_name or "").strip() or None
+        # 兼容 CLI：仅传入人名作为 vision_user_id 时，视为人名
+        if vid and not incoming_name and is_concrete_person_name(vid):
+            incoming_name = vid
         logger.info(
             "query 入参 vision_user_id=%s vision_user_name=%s voice_user_id=%s is_active_ask=%s is_obtain_name=%s",
-            vid_for_log,
-            name_for_log,
+            vid,
+            incoming_name,
             (voice_user_id or "").strip() or None,
             is_active_ask,
             is_obtain_name,
@@ -475,13 +517,6 @@ class RAGService:
             resolved_tags = resolved_tags + [_GENERAL_TAG]
             logger.info("叠加 general tag，最终检索 tag: %s", resolved_tags)
 
-        # 提前计算 vid（uuid 状态键）与传入姓名，供用户状态与询问姓名逻辑使用
-        vid = (vision_user_id or "").strip() or None
-        incoming_name = (vision_user_name or "").strip() or None
-        # 兼容 CLI：仅传入人名作为 vision_user_id 时，视为人名
-        if vid and not incoming_name and is_concrete_person_name(vid):
-            incoming_name = vid
-
         user_state: Optional[Dict[str, Any]] = None
         if vid:
             user_state = self.visitor_state.get_or_create(vid)
@@ -590,19 +625,17 @@ class RAGService:
             user_state = self.visitor_state.get_or_create(vid)
 
         robot_location_tags: List[str] = []
-        if (
-            not is_obtain_name
-            and not is_active_ask
-            and not is_navigation_turn
-            and self._pinned_navigation_tags
-        ):
-            robot_location_tags = self._filter_vehicle_location_tags(
-                self._pinned_navigation_tags
-            )
-            if robot_location_tags:
-                logger.info(
-                    "导航已完成，写入机器人位置: tags=%s", robot_location_tags
+        if not is_obtain_name and not is_active_ask and not is_navigation_turn:
+            if self._pinned_navigation_tags:
+                vehicle_tags = self._filter_vehicle_location_tags(
+                    self._pinned_navigation_tags
                 )
+                if vehicle_tags:
+                    self._robot_location_tags = vehicle_tags
+                    logger.info(
+                        "导航已完成，更新机器人位置: tags=%s", vehicle_tags
+                    )
+            robot_location_tags = list(self._robot_location_tags)
 
         prompt = build_prompt(
             raw_query,
@@ -616,6 +649,8 @@ class RAGService:
             is_active_ask=is_active_ask,
             active_ask_stage_hint=active_ask_stage_hint,
             robot_location_tags=robot_location_tags,
+            greeting_location_tag=self.greeting_location_tag,
+            greeting_location_label=self.greeting_location_label,
         )
         timings["build_context_prompt"] = time.perf_counter() - t2
         timings["total"] = (

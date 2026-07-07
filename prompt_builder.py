@@ -17,6 +17,14 @@ DEFAULT_ACTIVE_ASK_RETRIEVAL_QUERY = (
 # vision_user_id 为时间戳时的格式：年_月_日_分_秒
 TIMESTAMP_USER_ID_PATTERN = re.compile(r"^\d{4}_\d{1,2}_\d{1,2}_\d{1,2}_\d{1,2}$")
 
+# 机器人退下意图：LLM 回复最前端命中时重置为门口迎宾位置
+MOVE_TO_WAIT_INTENT_PREFIX = re.compile(
+    r"^\s*<INTENT>MOVE_TO_WAIT</INTENT>",
+    re.IGNORECASE,
+)
+GREETING_LOCATION_TAG = "greeting"
+DEFAULT_GREETING_LOCATION_LABEL = "门口迎宾位置"
+
 # 可导航地点（示例：A、B、C；可按展厅实际名称扩展）
 DEFAULT_VISIT_LOCATIONS: List[str] = ["A", "B", "C"]
 
@@ -171,11 +179,22 @@ def _build_user_context_lines(
     )
 
 
-def _build_robot_location_lines(robot_location_tags: Optional[List[str]]) -> str:
-    """导航完成后，将机器人当前所在展车点位写入 prompt。"""
+def _build_robot_location_lines(
+    robot_location_tags: Optional[List[str]],
+    greeting_location_tag: str = GREETING_LOCATION_TAG,
+    greeting_location_label: str = DEFAULT_GREETING_LOCATION_LABEL,
+) -> str:
+    """导航完成后或处于迎宾区时，将机器人当前位置写入 prompt。"""
     tags = [t.strip() for t in (robot_location_tags or []) if t and str(t).strip()]
     if not tags:
         return ""
+    if len(tags) == 1 and tags[0] == greeting_location_tag:
+        logger.info("机器人位置提示: %s", greeting_location_label)
+        return (
+            "【机器人位置】\n"
+            f"机器人当前在{greeting_location_label}。"
+            f"回答时可自然说明当前在门店入口/迎宾区，例如「我现在在{greeting_location_label}」。\n"
+        )
     if len(tags) == 1:
         display = tags[0]
         example = f"我现在旁边的车是{display}"
@@ -462,6 +481,8 @@ def build_prompt(
     is_active_ask: bool = False,
     active_ask_stage_hint: str = "",
     robot_location_tags: Optional[List[str]] = None,
+    greeting_location_tag: str = GREETING_LOCATION_TAG,
+    greeting_location_label: str = DEFAULT_GREETING_LOCATION_LABEL,
 ) -> str:
     """
     组装 RAG 提示词字符串，融合访客身份、意图状态与导航地点指令。
@@ -490,7 +511,11 @@ def build_prompt(
         should_ask_name=should_ask_name,
         vision_user_name=vision_user_name,
     )
-    robot_location_line = _build_robot_location_lines(robot_location_tags)
+    robot_location_line = _build_robot_location_lines(
+        robot_location_tags,
+        greeting_location_tag=greeting_location_tag,
+        greeting_location_label=greeting_location_label,
+    )
     intent_line, detected_location = _build_intent_instruction_lines(query, visit_locations)
     if detected_location:
         logger.info("参观意向已识别地点: %s", detected_location)
