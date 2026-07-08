@@ -44,43 +44,48 @@ from .visitor_state import VisitorStateStore
 STAGE_ACTIVE_ASK_CONFIG: dict = {
     "greeting": (
         "active_ask_greeting",
-        "进店问候 欢迎顾客 第一次来店 首次拜访 展厅接待",
-        "顾客刚进入展厅，尚未开口，请主动问候并判断是否首次来访",
+        "展厅接待 进店问候 欢迎顾客 首次来访 建立信任",
+        "顾客刚进入展厅或短暂停留，请先自然问候、建立信任，再轻量判断是否首次来访",
     ),
-    "needs_exploration": (
-        "active_ask_needs",
-        "探寻需求 购车意向 用车场景 家庭用车 关注哪款车",
-        "已完成问候，需主动了解顾客用车场景、家庭情况与关注车型",
+    "needs_analysis": (
+        "active_ask_needs_analysis",
+        "需求分析 用车场景 预算 决策人 换车原因 关注点",
+        "已完成接待问候，请结合历史对话补齐需求信息，优先询问当前最缺的用车场景、预算、决策人或关注点",
     ),
-    "powertrain_range": (
-        "active_ask_power",
-        "续航介绍 增程技术 充电 使用成本 引导讲解动力",
-        "需求已了解，主动引导顾客关注动力续航与使用成本亮点",
+    "vehicle_selection": (
+        "active_ask_vehicle_selection",
+        "车型推荐 版本推荐 配置推荐 纯电增程 家用通勤 长途",
+        "需求已有基础信息，请主动把需求转成车型、版本或配置方向建议，不要直接进入报价",
     ),
-    "exterior_chassis": (
-        "active_ask_exterior",
-        "车外讲解 底盘 后轮转向 安全 引导走到展车旁边",
-        "动力讲完，带顾客走到展车旁，主动引导观察底盘与安全配置",
-    ),
-    "driver_cockpit": (
-        "active_ask_cockpit",
-        "引导上车 主驾体验 大屏幕 座舱介绍 雨夜模式",
-        "车外讲完，引导顾客坐进主驾，主动介绍座舱与智能功能",
-    ),
-    "copilot_rear": (
-        "active_ask_rear",
-        "副驾 后排空间 冰箱 零重力 贵妃椅 后备箱",
-        "主驾体验完毕，带顾客移步副驾和后排，主动介绍舒适与家用配置",
+    "product_presentation": (
+        "active_ask_product_presentation",
+        "车辆展示 六方位绕车 外观 内饰 座舱 空间 安全 智能",
+        "车型方向已明确，请围绕顾客关心点做通用车辆展示，引导看外观、座舱、空间、安全或智能亮点",
     ),
     "test_drive": (
         "active_ask_testdrive",
-        "邀请试驾 安排试驾 亲自体验驾驶 感受上路",
-        "产品介绍已完成，主动邀请顾客安排试驾体验",
+        "试乘试驾 邀请试驾 路线说明 安全确认 驾驶反馈",
+        "车辆展示已完成，请主动邀请试乘试驾，或在试驾后承接顾客反馈",
     ),
-    "purchase_intent": (
-        "active_ask_purchase",
-        "价格 优惠 金融方案 下订 购买意向 交付周期",
-        "试驾结束，主动引导顾客进入价格与购买意向沟通",
+    "quote_negotiation": (
+        "active_ask_quote_negotiation",
+        "报价协商 价格 权益 金融 置换 补贴 预算异议",
+        "试驾或产品体验后，请主动进入价格、权益、金融或置换沟通，并先确认顾客预算与付款偏好",
+    ),
+    "deal_confirmation": (
+        "active_ask_deal_confirmation",
+        "成交确认 下订 配置 颜色 库存 合同 定金 异议处理",
+        "报价沟通后，请确认顾客购买意向、配置颜色和主要顾虑，必要时推进下订或保留方案",
+    ),
+    "delivery_explanation": (
+        "active_ask_delivery_explanation",
+        "交车说明 交付周期 验车 上牌 功能讲解 售后对接",
+        "顾客已有下订或强购买意向，请说明交付流程、验车上牌、用车交接和售后对接",
+    ),
+    "after_sales_followup": (
+        "active_ask_after_sales_followup",
+        "售后跟进 回访 保养 质保 服务提醒 转介绍",
+        "交车说明已完成，请以服务关怀收尾，提醒后续回访、保养、用车支持或转介绍服务",
     ),
 }
 # ─────────────────────────────────────────────────────────────────────────────
@@ -615,13 +620,7 @@ class RAGService:
                         self._pending_name_user_id = vid
 
         if vid and is_active_ask and not is_obtain_name:
-            advanced_step = self.visitor_state.mark_next_tour_step(vid)
-            if advanced_step:
-                logger.info(
-                    "主动招呼推进观车流程: vision_user_id=%s step_id=%s",
-                    vid,
-                    advanced_step,
-                )
+            # 主动询问不直接推进阶段；阶段完成仍由用户问题 + LLM 回复的语言规则后处理决定。
             user_state = self.visitor_state.get_or_create(vid)
 
         robot_location_tags: List[str] = []

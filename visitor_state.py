@@ -9,48 +9,53 @@ from RAG.config.logger_runtime import get_logger
 
 logger = get_logger("rag")
 
-# 精简后的销售导购流程（8 个核心阶段，按真实门店接待顺序排列）
+# 顾问式汽车销售流程（9 个核心阶段，按真实门店接待顺序排列）
 # 每个 step 的 id 与 tour_lang_rules.py 中的规则 key 严格对应
 DEFAULT_TOUR_STEPS: List[Dict[str, Any]] = [
     {
         "id": "greeting",
-        "title": "① 接待问候：进店欢迎，判断是否首次来访",
+        "title": "① 展厅接待：进店问候，建立信任",
         "order": 1,
     },
     {
-        "id": "needs_exploration",
-        "title": "② 探寻需求：用车场景、用车人、关注车型",
+        "id": "needs_analysis",
+        "title": "② 需求分析：用途、预算、决策人、换购原因",
         "order": 2,
     },
     {
-        "id": "powertrain_range",
-        "title": "③ 动力续航：增程/纯电技术、800V补能、使用成本",
+        "id": "vehicle_selection",
+        "title": "③ 车型推荐：匹配车型、版本和配置方向",
         "order": 3,
     },
     {
-        "id": "exterior_chassis",
-        "title": "④ 车外讲解：底盘/后轮转向/安全/智驾",
+        "id": "product_presentation",
+        "title": "④ 车辆展示：六方位讲解与核心卖点体验",
         "order": 4,
     },
     {
-        "id": "driver_cockpit",
-        "title": "⑤ 主驾体验：5K大屏、雨夜模式、一键泊车",
+        "id": "test_drive",
+        "title": "⑤ 试乘试驾：路线说明、体验引导、反馈确认",
         "order": 5,
     },
     {
-        "id": "copilot_rear",
-        "title": "⑥ 副驾后排：零重力座椅、后排空间、大冰箱",
+        "id": "quote_negotiation",
+        "title": "⑥ 报价协商：价格、权益、金融、置换方案",
         "order": 6,
     },
     {
-        "id": "test_drive",
-        "title": "⑦ 邀请试驾：引导顾客实际驾驶体验",
+        "id": "deal_confirmation",
+        "title": "⑦ 成交确认：配置颜色、下订意向、异议处理",
         "order": 7,
     },
     {
-        "id": "purchase_intent",
-        "title": "⑧ 购买意向：价格/金融方案/下订意向确认",
+        "id": "delivery_explanation",
+        "title": "⑧ 交车说明：交付流程、用车事项、售后对接",
         "order": 8,
+    },
+    {
+        "id": "after_sales_followup",
+        "title": "⑨ 售后跟进：回访提醒、服务关怀、转介绍",
+        "order": 9,
     },
 ]
 
