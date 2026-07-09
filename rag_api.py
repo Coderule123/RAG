@@ -648,6 +648,7 @@ class RAGService:
             is_active_ask=is_active_ask,
             active_ask_stage_hint=active_ask_stage_hint,
             robot_location_tags=robot_location_tags,
+            active_tags=resolved_tags,
             greeting_location_tag=self.greeting_location_tag,
             greeting_location_label=self.greeting_location_label,
         )

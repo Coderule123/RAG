@@ -179,6 +179,75 @@ def _build_user_context_lines(
     )
 
 
+# 展车 tag 与对外车型名（与 data/l6、data/ls6 等目录一致）
+VEHICLE_TAG_DISPLAY_NAMES: dict[str, str] = {
+    "l6": "智己L6",
+    "ls6": "智己LS6",
+    "ls7": "智己LS7",
+    "ls8": "智己LS8",
+    "ls9": "智己LS9",
+}
+_EXCLUDED_VEHICLE_REFERENCE_TAGS = frozenset({"general"})
+_EXCLUDED_VEHICLE_REFERENCE_PREFIXES = ("active_ask",)
+
+
+def _filter_vehicle_tags(
+    tags: Optional[List[str]],
+    greeting_location_tag: str = GREETING_LOCATION_TAG,
+) -> List[str]:
+    """从 tag 列表中筛出展车点位（排除 general、greeting、active_ask* 等）。"""
+    greeting = (greeting_location_tag or "").strip().lower()
+    result: List[str] = []
+    for tag in tags or []:
+        normalized = (tag or "").strip().lower()
+        if not normalized or normalized == greeting:
+            continue
+        if normalized in _EXCLUDED_VEHICLE_REFERENCE_TAGS:
+            continue
+        if any(normalized.startswith(prefix) for prefix in _EXCLUDED_VEHICLE_REFERENCE_PREFIXES):
+            continue
+        result.append(normalized)
+    return result
+
+
+def _resolve_single_vehicle_tag(
+    active_tags: Optional[List[str]] = None,
+    robot_location_tags: Optional[List[str]] = None,
+    greeting_location_tag: str = GREETING_LOCATION_TAG,
+) -> Optional[str]:
+    """检索 tag 与机器人位置合并后，若仅锁定单一展车则返回其 tag。"""
+    vehicle_tags = _filter_vehicle_tags(active_tags, greeting_location_tag)
+    for tag in _filter_vehicle_tags(robot_location_tags, greeting_location_tag):
+        if tag not in vehicle_tags:
+            vehicle_tags.append(tag)
+    unique = list(dict.fromkeys(vehicle_tags))
+    return unique[0] if len(unique) == 1 else None
+
+
+def _build_vehicle_reference_lines(
+    active_tags: Optional[List[str]] = None,
+    robot_location_tags: Optional[List[str]] = None,
+    greeting_location_tag: str = GREETING_LOCATION_TAG,
+) -> str:
+    """单一车型上下文时，引导 LLM 用「咱们这款车」等口语指代，避免生硬重复车型名。"""
+    single_tag = _resolve_single_vehicle_tag(
+        active_tags, robot_location_tags, greeting_location_tag
+    )
+    if not single_tag:
+        return ""
+    display_name = VEHICLE_TAG_DISPLAY_NAMES.get(single_tag, single_tag.upper())
+    logger.info("单一车型上下文: tag=%s display=%s", single_tag, display_name)
+    return (
+        "【口径 — 车型指代】\n"
+        f"当前对话已锁定单一车型（{display_name}），顾客正在看或咨询这款车。\n"
+        "回答时用「咱们这款车」「我们这款车」「这款车」等展厅导购口语指代，"
+        f"不要每句都以「{display_name}」开头或重复堆砌车型名；语气应像站在展车旁的真实导购。\n"
+        "但以下情况仍须保留完整车型/版本名称：用户明确对比多个车型；"
+        "回答涉及具体款型/配置版本（如 Max、Ultra、74kWh）或精确参数数值时；"
+        "【资料】原文中的版本名、价格档位可直接引用，无需改成「咱们这款车」。\n"
+    )
+
+
 def _build_robot_location_lines(
     robot_location_tags: Optional[List[str]],
     greeting_location_tag: str = GREETING_LOCATION_TAG,
@@ -484,6 +553,7 @@ def build_prompt(
     is_active_ask: bool = False,
     active_ask_stage_hint: str = "",
     robot_location_tags: Optional[List[str]] = None,
+    active_tags: Optional[List[str]] = None,
     greeting_location_tag: str = GREETING_LOCATION_TAG,
     greeting_location_label: str = DEFAULT_GREETING_LOCATION_LABEL,
 ) -> str:
@@ -519,6 +589,11 @@ def build_prompt(
         greeting_location_tag=greeting_location_tag,
         greeting_location_label=greeting_location_label,
     )
+    vehicle_reference_line = _build_vehicle_reference_lines(
+        active_tags=active_tags,
+        robot_location_tags=robot_location_tags,
+        greeting_location_tag=greeting_location_tag,
+    )
     intent_line, detected_location = _build_intent_instruction_lines(query, visit_locations)
     if detected_location:
         logger.info("参观意向已识别地点: %s", detected_location)
@@ -553,6 +628,7 @@ def build_prompt(
         "\n"
         "{user_line}\n"
         "{robot_location_line}\n"
+        "{vehicle_reference_line}\n"
         "{intent_line}\n"
         "【资料】\n"
         "{context}\n"
@@ -567,6 +643,7 @@ def build_prompt(
         base_instruction=base_instruction,
         user_line=user_line,
         robot_location_line=robot_location_line,
+        vehicle_reference_line=vehicle_reference_line,
         intent_line=intent_line,
         context=context,
         question=query,
