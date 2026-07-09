@@ -224,6 +224,26 @@ def _resolve_single_vehicle_tag(
     return unique[0] if len(unique) == 1 else None
 
 
+def _build_conversation_history_usage_lines() -> str:
+    """
+    引导 LLM 使用当前会话中已恢复的 HumanMessage/AIMessage 历史。
+
+    历史对话由 LLM Agent 按人脸/视觉 ID（thread_id）从 db checkpointer 自动恢复，
+    无需在 RAG prompt 中重复拼接历史文本。
+    """
+    return (
+        "【对话历史 — 使用方式】\n"
+        "当前会话上下文中已包含基于人脸 ID 恢复的历史 HumanMessage/AIMessage，"
+        "请直接阅读这些消息作为对这位用户的记忆。\n"
+        "用户已经问过、已经确认或已经得到回答的信息，不要再次追问；"
+        "应自然承接（例如「刚才您关注的……」），表现出记得对方此前说过什么。\n"
+        "当用户本轮使用「这个」「刚才那个」「它」「还有呢」等省略表达，"
+        "或未明确说明车型、版本、配置、预算、用途等主语时，"
+        "优先结合上述历史消息补全语义，再结合【资料】作答；"
+        "不要把历史来源说成数据库、记录或系统信息。\n"
+    )
+
+
 def _build_vehicle_reference_lines(
     active_tags: Optional[List[str]] = None,
     robot_location_tags: Optional[List[str]] = None,
@@ -455,13 +475,14 @@ def _build_active_ask_prompt(query: str, context: str, stage_hint: str = "") -> 
         "当前没有收到顾客的有效提问，由你主动开口。\n"
         "你的角色是展厅智能导购助手小特，像一位真人专业导购一样，"
         "自然、礼貌地引导顾客进入下一个体验环节。\n"
-        "如果当前会话中已有历史对话记录，必须先参考历史对话判断顾客已经表达过的需求、疑虑、车型偏好、预算和体验反馈；"
+        "当前会话上下文中已包含基于人脸 ID 恢复的历史 HumanMessage/AIMessage；"
+        "必须先阅读这些历史消息，判断顾客已经表达过的需求、疑虑、车型偏好、预算和体验反馈；"
         "不要重复询问已经回答过的问题，应在【当前导购阶段目标】内选择最适合继续推进的一句主动询问或引导。\n"
         "\n"
         "【输出要求 — 必须全部遵守】\n"
         "1. 直接输出面向顾客的一句或两句中文口语，禁止输出 <INTENT>、<LOCATION> 等任何标签。\n"
         "2. 必须结合【当前导购阶段目标】，让话语有明确的引导方向，而不是泛泛问候。\n"
-        "3. 必须结合历史对话选择最合适的下一问：缺什么问什么，已确认的内容只简短承接，不重复盘问。\n"
+        "3. 必须结合会话中的历史 HumanMessage/AIMessage 选择最合适的下一问：缺什么问什么，已确认的内容只简短承接，不重复盘问。\n"
         "4. 可参考【主动话术资料】中的风格与范例，但必须改写为自然口语，"
         "禁止照搬原文、禁止罗列条目、禁止像念稿。\n"
         "5. 禁止在回复中出现资料分类名、文件夹名、tag 名（如 active_ask、ls6 等）"
@@ -598,6 +619,8 @@ def build_prompt(
     if detected_location:
         logger.info("参观意向已识别地点: %s", detected_location)
 
+    history_usage_line = _build_conversation_history_usage_lines()
+
     base_instruction = (
         "基于【资料】回答问题，不要编造未经资料支持的具体价格、参数、配置或政策。\n"
         "回答车型配置、功能和参数问题时，优先使用【资料】里的明确字段；如果用户问法较口语，"
@@ -605,8 +628,8 @@ def build_prompt(
         "整合回答为「车灯有哪些功能」。\n"
         "如果【资料】没有精确数值或某一版本的细项，不要直接输出「抱歉」「无法回答」「资料不足」；"
         "应先说明已知的相关信息，再用「具体以当前门店配置表为准」等方式弱化未知细节。"
-        "只有当问题完全脱离车辆、品牌、导购和展厅范围，且历史对话也无法补足主语时，才简短说明暂时无法确认。\n"
-        "如果【资料】中的内容不足以回答问题，则根据历史对话记录合理推测每次问题的主语，"
+        "只有当问题完全脱离车辆、品牌、导购和展厅范围，且会话历史也无法补足主语时，才简短说明暂时无法确认。\n"
+        "如果【资料】中的内容不足以回答问题，则结合会话中的历史 HumanMessage/AIMessage 推测问题主语，"
         "并结合【资料】中的内容回答问题。\n"
     )
 
@@ -626,6 +649,7 @@ def build_prompt(
         "你是一个智能导购助手，你的名字叫小特。请严格遵循以下要求：\n"
         "{base_instruction}\n"
         "\n"
+        "{history_usage_line}\n"
         "{user_line}\n"
         "{robot_location_line}\n"
         "{vehicle_reference_line}\n"
@@ -641,6 +665,7 @@ def build_prompt(
     prompt = ChatPromptTemplate.from_template(template)
     return prompt.format(
         base_instruction=base_instruction,
+        history_usage_line=history_usage_line,
         user_line=user_line,
         robot_location_line=robot_location_line,
         vehicle_reference_line=vehicle_reference_line,
