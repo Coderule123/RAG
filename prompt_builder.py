@@ -64,19 +64,50 @@ def extract_visit_location(query: str,locations: Optional[List[str]] = None,) ->
         return None
     return ",".join(matched)
 
-def _build_intent_instruction_lines(query: str,locations: Optional[List[str]] = None,) -> Tuple[str, Optional[str]]:
+def _build_intent_state_rules_block() -> str:
+    """
+    生成始终存在的【意图状态】输出契约。
+
+    与 orin.toml / 下游解析约定对齐：标签必须位于回复最开头，
+    以便 MOVE_TO_WAIT 等前缀匹配与流式切分生效。
+    """
+    return (
+        "【意图状态 — 强制输出格式】\n"
+        "每一条面向用户的回复都必须以状态标签开头；标签前不得有任何字符"
+        "（含空格、换行、标点、表情）。\n"
+        "正确格式：<INTENT>状态</INTENT>正文……\n"
+        "错误示例（禁止）：正文……<INTENT>状态</INTENT>\n"
+        "错误示例（禁止）：好的，<INTENT>状态</INTENT>……\n"
+        "可用状态：\n"
+        "- NEEDS_GUIDANCE：用户明确要参观/带看/逛展区\n"
+        "- MOVE_TO_WAIT：用户明确让机器人退下/不用了/回去充电\n"
+        "- INTERRUPT：用户明确要求打断/先停一下\n"
+        "- WAIT_FOR_TALK：普通对话或不确定时的默认状态\n"
+        "不确定时一律使用 WAIT_FOR_TALK。\n"
+        "严禁省略标签；严禁把标签放在句中或句末。\n"
+        "<LOCATION> 仅允许出现在【参观意向】明确给出预设地点时；"
+        "其余情况一律禁止输出 <LOCATION>。\n"
+    )
+
+
+def _build_intent_instruction_lines(
+    query: str,
+    locations: Optional[List[str]] = None,
+) -> Tuple[str, Optional[str]]:
     """
     生成意图与地点相关的输出格式说明。
     返回 (instruction_text, detected_location)。
+
+    始终包含【意图状态】强制规则；参观意向时追加【参观意向】约束。
     """
     detected_location = extract_visit_location(query, locations)
-
-    intent_rules = ""
+    intent_rules = _build_intent_state_rules_block()
 
     if detected_location:
         intent_rules += (
             f"【参观意向】用户问题已命中预设地点：{detected_location}。\n"
-            f"若意图状态为 NEEDS_GUIDANCE，标签必须严格输出为 <INTENT>NEEDS_GUIDANCE<LOCATION>{detected_location}</LOCATION></INTENT>，"
+            f"若意图状态为 NEEDS_GUIDANCE，标签必须严格输出为 "
+            f"<INTENT>NEEDS_GUIDANCE<LOCATION>{detected_location}</LOCATION></INTENT>，"
             f"<LOCATION> 内只能填写 {detected_location}，禁止填写任何其他文字。"
             "并在正文中简要说明将引导对方前往该地点。\n"
         )
@@ -87,7 +118,7 @@ def _build_intent_instruction_lines(query: str,locations: Optional[List[str]] = 
             "用户表达了参观/游览意向，但问题中未命中任何预设地点（"
             + loc_list
             + "）。\n"
-            "本次必须询问用户想参观哪个区域；"
+            "本次意图状态应使用 NEEDS_GUIDANCE，并询问用户想参观哪个区域；"
             "严格禁止输出 <LOCATION> 标签，也禁止将用户话语中的任意文字作为地点值写入标签。\n"
         )
 
@@ -250,7 +281,7 @@ def _build_robot_capability_boundary_lines() -> str:
         "【机器人能力边界】\n"
         "你是展厅智能助手小特，只能通过语音讲解和引导参观展区（触发导航），不能执行任何物理动作。\n"
         "你可以做的：介绍品牌/车型/配置/参数，解答疑问，引导用户梳理需求，"
-        "在用户明确表达参观意向时引导前往展区（配合 <INTENT>NEEDS_GUIDANCE>）。\n"
+        "在用户明确表达参观意向时引导前往展区（配合 <INTENT>NEEDS_GUIDANCE</INTENT>）。\n"
         "禁止承诺或暗示自己能：递水/拿东西、开关车门、上车演示、操作车机按钮、取车钥匙、"
         "亲自安排或陪同试驾、签合同、办理保险/上牌/验车、查询库存排产、替用户联系第三方等线下事务。\n"
         "当【资料】出现上述不可执行的动作承诺时，必须改写，不得照搬：\n"
