@@ -101,12 +101,25 @@ def main() -> None:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return
 
-    chunks = split_documents(docs, args.chunk_size, args.overlap)
-
+    # Embedding 提前初始化：切分阶段的语义断点检测与入库共用同一模型
     embed = EmbeddingService(
         model_name=args.embedding_model,
         sentence_cache_dir=hf_runtime["sentence_cache_dir"],
         local_files_only=bool(hf_cfg.get("local_files_only", False)),
+    )
+
+    chunks = split_documents(
+        docs,
+        args.chunk_size,
+        args.overlap,
+        max_chunk_size=vector.get("max_chunk_size"),
+        min_chunk_chars=int(vector.get("min_chunk_chars", 15)),
+        add_context_header=bool(vector.get("add_context_header", True)),
+        embeddings_model=embed,
+        semantic_split=bool(vector.get("semantic_split", True)),
+        semantic_breakpoint_percentile=float(
+            vector.get("semantic_breakpoint_percentile", 88)
+        ),
     )
     store = VectorStore(index_dir=args.index_dir, data_dir=args.data_dir)
     result = store.build_or_append(

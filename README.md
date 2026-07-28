@@ -31,11 +31,26 @@ pip install -r requirements.txt -i https://mirrors.tuna.tsinghua.edu.cn/pypi/web
 ## 3. DP：构建向量库
 
 运行 `DP/document_processor.py` 即可完成：
-加载文档（增量时仅读 `doc_hash.json`）-> 语义切分 -> 向量化 -> 写入 FAISS（LangChain）+ 按文档文件名的 `metadata/*` + `doc_hash.json` + sqlite。
+加载文档（增量时仅读 `doc_hash.json`）-> 结构感知/语义切分 -> 向量化 -> 写入 FAISS（LangChain）+ 按文档文件名的 `metadata/*` + `doc_hash.json` + sqlite。
+
+### 3.0 文档处理策略（按格式）
+
+| 格式 | 加载策略 | 切分策略 |
+| --- | --- | --- |
+| json 问答数组 | 每个 instruction/output 展开为独立记录 | 原子入库，不二次切分 |
+| txt / md | Markdown 标题解析；纯文本按启发式提升标题（章节编号行、短标题行） | 结构切分 |
+| pdf | 优先 pdfplumber（表格转 Markdown、正文排除表格区）；去页眉页脚/页码；跨行/跨页断句修复；启发式标题提升；chunk 保留页码 | 结构切分 |
+| docx | 优先 python-docx（Heading 样式 -> 标题层级、表格 -> Markdown）；退回 docx2txt | 结构切分 |
+| csv | 按行展开（带表头字段名） | 原子入库 |
+
+结构切分流程：按标题树切成章节 -> 同父级小节合并至约 `chunk_size` -> 超过 `max_chunk_size` 的章节二次切分（优先 **embedding 语义断点**：相邻句向量相似度低谷断开；无 embedding 或句子过少时退回递归字符切分）。
+
+每个 chunk 头部注入「【所属章节】文档标题 > 章节路径」（`vector_index.add_context_header` 控制），使"52 Max 多少钱"这类问题能精确召回对应配置版本的参数块；chunk 的 `metadata.section_path` / `split_method` / `page`（PDF）可用于追溯。JSON 问答记录不加上下文头、保持原文向量化（维持既有效果）。
 
 ```bash
 # export HF_ENDPOINT=https://hf-mirror.com
 cd /path/to/仓库根
+# source /home/ymrobot/ws/ymbot/venv/bin/activate
 # cd /home/ymrobot/ws/ymbot/ASR_LLM_TTS/chat_assistant
 python3 -m RAG.DP.document_processor
 ```
@@ -61,6 +76,7 @@ python3 -m RAG.DP.document_processor \
 
 ```bash
 cd /path/to/仓库根   # 含顶层包目录 RAG/，且已激活 venv
+# source /home/ymrobot/ws/ymbot/venv/bin/activate
 # cd /home/ymrobot/ws/ymbot/ASR_LLM_TTS/chat_assistant
 
 python3 -m RAG.DP.index_chunk_delete \
@@ -107,6 +123,7 @@ python3 -m RAG.DP.index_chunk_delete \
 ```bash
 # export HF_ENDPOINT=https://hf-mirror.com
 cd /path/to/仓库根
+# source /home/ymrobot/ws/ymbot/venv/bin/activate
 # cd /home/ymrobot/ws/ymbot/ASR_LLM_TTS/chat_assistant
 ```
 
@@ -148,8 +165,8 @@ python3 -m RAG.rag_api --query "RAG是什么？"--user-id "张三"
 
 ### DP
 
-- `DP/document_loader.py`：文档加载
-- `DP/semantic_splitter.py`：语义切分
+- `DP/document_loader.py`：文档加载（PDF/DOCX 结构还原、页眉页脚清理、启发式标题提升，统一输出 Markdown 结构文本）
+- `DP/semantic_splitter.py`：结构感知切分（标题树 + 小节合并 + 语义断点二次切分 + 章节路径上下文头）
 - `DP/embedding_service.py`：Embedding 封装
 - `DP/vector_store.py`：LangChain FAISS 持久化，维护 `doc_hash.json` 与 `metadata/`（镜像 `data/` 目录结构）分文件元数据，并提供 `delete_by_metadata_selector` 按 `source` / metadata 路径与 `doc_id`、`chunk_id` 删除后重写落盘
 - `DP/index_chunk_delete.py`：删除脚本入口（调用上述能力）
@@ -164,7 +181,7 @@ python3 -m RAG.rag_api --query "RAG是什么？"--user-id "张三"
 - `RAG/rag_api.py`：运行时流程入口（到 Prompt 为止）
 
 ## 7.接口示例
- 
+
 - 初始化
 
 ```bash
@@ -194,7 +211,8 @@ rag_result = self.rag_client.query(query="", is_active_ask=True)
 独立 Web 管理页，用于文档上传/移动、向量查看与删除、一键增量建库。**不随 `run.sh` 启动**，需要时手动运行：
 
 ```bash
-cd /path/to/chat_assistant
+# source /home/ymrobot/ws/ymbot/venv/bin/activate
+# cd /home/ymrobot/ws/ymbot/ASR_LLM_TTS/chat_assistant
 python3 -m RAG.web.rag_web_server --host 0.0.0.0 --port 17892
 # 浏览器打开 http://127.0.0.1:17892
 ```
@@ -204,3 +222,6 @@ python3 -m RAG.web.rag_web_server --host 0.0.0.0 --port 17892
 - **文档管理**：查看 `data/` 下文件及索引状态，上传到指定 tag，移动或删除文件
 - **向量数据**：浏览 metadata 中的 chunk，按 doc_id / chunk_id 删除或删除整篇文档向量
 - **建库**：一键执行与 `document_processor` 相同的预处理/增量建库流程
+
+source /home/liujinyou/ws_asr-rag/ymbot/ASR_LLM_TTS/install/setup.bash
+ros2 service call /chat_assistant_infer chat_assistant_interfaces/srv/RequestChat "{input_text: '你们这都有什么车呀', user_id: '', voice_id: ''}"

@@ -526,18 +526,26 @@ class JobRunner:
             self._finish_success(result)
             return
 
-        self._set_running_message(f"语义切分 {len(docs)} 篇文档…")
-        chunks = split_documents(
-            docs,
-            int(payload.get("chunk_size", vector.get("chunk_size", 500))),
-            int(payload.get("overlap", vector.get("overlap", 80))),
-        )
-
         self._set_running_message("加载 Embedding 模型…")
         embed = EmbeddingService(
             model_name=models.get("embedding_model", "BAAI/bge-small-zh-v1.5"),
             sentence_cache_dir=hf_runtime["sentence_cache_dir"],
             local_files_only=bool(hf_cfg.get("local_files_only", False)),
+        )
+
+        self._set_running_message(f"语义切分 {len(docs)} 篇文档…")
+        chunks = split_documents(
+            docs,
+            int(payload.get("chunk_size", vector.get("chunk_size", 500))),
+            int(payload.get("overlap", vector.get("overlap", 80))),
+            max_chunk_size=vector.get("max_chunk_size"),
+            min_chunk_chars=int(vector.get("min_chunk_chars", 15)),
+            add_context_header=bool(vector.get("add_context_header", True)),
+            embeddings_model=embed,
+            semantic_split=bool(vector.get("semantic_split", True)),
+            semantic_breakpoint_percentile=float(
+                vector.get("semantic_breakpoint_percentile", 88)
+            ),
         )
 
         self._set_running_message(f"写入向量库 {len(chunks)} 个 chunk…")

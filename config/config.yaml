@@ -44,8 +44,13 @@ visit_locations:
 
 # 切分与入库（DP/document_processor.py）
 vector_index:
-  chunk_size: 500
-  overlap: 80
+  chunk_size: 500 # 目标块大小（结构切分时也是「小节合并」预算）
+  overlap: 80 # 递归切分回退方案的重叠字符数
+  max_chunk_size: 700 # 超过该长度的章节触发二次切分（语义断点/递归）；缺省为 1.4*chunk_size
+  min_chunk_chars: 15 # 低于该长度的碎片块直接丢弃
+  add_context_header: true # chunk 头部注入「文档标题 > 章节路径」（提升车型/章节定位检索）
+  semantic_split: true # 无结构长文本使用 embedding 语义断点切分（相邻句相似度低谷断开）
+  semantic_breakpoint_percentile: 88 # 语义断点阈值百分位（越高断点越少、块越大）
   batch_size: 128 # 预留：当前入库为整批 add_documents，可按需改批处理
   incremental: true # true：在已有 faiss_store 上追加；false：全量重建
 

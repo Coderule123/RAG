@@ -14,6 +14,9 @@ sentence-transformers
 numpy
 pypdf
 docx2txt
+# 可选增强（未安装时自动退回 pypdf / docx2txt）：
+pdfplumber # PDF 表格抽取 + 更好的版面文本
+python-docx # Word 标题层级 / 表格结构还原
 
 # --- 配置 ---
 pyyaml
