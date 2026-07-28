@@ -27,6 +27,7 @@ retrieval:
   vector_threshold: 0.3 # 向量分数阈值（普通对话）
   active_ask_vector_threshold: 0.0 # 主动招呼模式专用阈值：tag 已收窄至 active_ask，无需额外过滤
   ask_name_reask_timeout_sec: 18000 # 姓名重问阈值：距离首次询问超过该秒数将再次询问
+  max_name_extract_attempts: 2 # 姓名抽取最大自动尝试次数（含首次）；失败后下一轮用户话语可再次触发抽取
   active_ask_tag: active_ask # 主动招呼模式固定检索的 metadata.tag（对应 data/active_ask/）
   active_ask_retrieval_query: "展厅主动招呼 欢迎语 引导顾客交流 开口话术 接待用语" # query 为空时用于向量检索
   default_navigation_tag: ls6 # 参观意向但未命中预设地点时，下轮检索使用的默认 tag

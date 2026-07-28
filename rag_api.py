@@ -29,7 +29,9 @@ from .prompt_builder import (
     DEFAULT_GREETING_LOCATION_LABEL,
     GREETING_LOCATION_TAG,
     MOVE_TO_WAIT_INTENT_PREFIX,
+    build_echo_name_prompt,
     build_prompt,
+    extract_name_by_rules,
     is_concrete_person_name,
     resolve_pending_navigation_tags,
 )
@@ -165,6 +167,8 @@ class RAGService:
         self.second_ask = False
         # 触发 second_ask 时对应的 visitor id，用于检测 user_id 切换
         self._pending_name_user_id: Optional[str] = None
+        # 姓名抽取已尝试次数：失败后保留 second_ask 以便下一轮继续抽取，直到达到上限
+        self._name_extract_attempts = 0
 
         # tag 检索状态：_active_tags 跨 query() 调用持久保存，实现「沿用上次 tag」
         self._active_tags: List[str] = []
@@ -192,6 +196,10 @@ class RAGService:
         self.use_reranker = retrieval_cfg.get("use_reranker", True)
         self.ask_name_reask_timeout_sec = float(
             retrieval_cfg.get("ask_name_reask_timeout_sec", 5000)
+        )
+        # 姓名抽取最大自动尝试次数（含首次）；抽取失败时下一轮用户话语可再次触发抽取
+        self.max_name_extract_attempts = max(
+            1, int(retrieval_cfg.get("max_name_extract_attempts", 2))
         )
 
         # 初始化 Embedding 服务（与建库同模型）
@@ -307,6 +315,7 @@ class RAGService:
             self.second_ask = False
             self.second = False
             self._pending_name_user_id = None
+        self._name_extract_attempts = 0
         logger.info(
             "已写入抽取姓名: vision_user_id=%s person_name=%s", vid, name
         )
@@ -404,6 +413,10 @@ class RAGService:
             raise ValueError("is_obtain_name 与 is_active_ask 不能同时为 True")
 
         vid = (vision_user_id or "").strip() or None
+        # pending-vid：姓名抽取轮调用方通常不传 vid，回退到触发询问姓名时记录的用户
+        if is_obtain_name and not vid and self._pending_name_user_id:
+            vid = self._pending_name_user_id
+            logger.info("姓名抽取轮回退使用待抽取用户: %s", vid)
         incoming_name = (vision_user_name or "").strip() or None
         # 兼容 CLI：仅传入人名作为 vision_user_id 时，视为人名
         if vid and not incoming_name and is_concrete_person_name(vid):
@@ -535,14 +548,50 @@ class RAGService:
                 user_state.get("person_name"),
             )
 
-        # 如果调用方明确要求这是提取姓名的请求，重置实例级 second 为 False
+        # 姓名抽取请求：先走规则快速路径（我叫XX / 我姓X → 确定性抽取），
+        # 未命中再计入尝试次数、交由 LLM 语义抽取
+        rule_extracted_name = ""
         if is_obtain_name:
-            self.second_ask = False
-            self.second = False
+            rule_extracted_name = extract_name_by_rules(raw_query)
+            if rule_extracted_name:
+                logger.info(
+                    "规则快速路径命中姓名: %r（跳过 LLM 语义抽取）",
+                    rule_extracted_name,
+                )
+                if vid:
+                    # 直接写入用户状态并重置询问标志（不依赖 LLM 回显成败）
+                    self.commit_extracted_name(vid, rule_extracted_name)
+                else:
+                    # 无可关联用户：仅重置状态，姓名由调用方自行落盘
+                    self.second_ask = False
+                    self.second = False
+                    self._pending_name_user_id = None
+                    self._name_extract_attempts = 0
+            else:
+                # 未达上限则保留 second_ask，本次抽取失败时下一轮用户话语
+                # 仍可再次触发抽取；达到上限则放弃自动重试
+                self._name_extract_attempts += 1
+                if self._name_extract_attempts >= self.max_name_extract_attempts:
+                    logger.info(
+                        "姓名抽取尝试 %d/%d 已达上限，停止自动重试",
+                        self._name_extract_attempts,
+                        self.max_name_extract_attempts,
+                    )
+                    self.second_ask = False
+                    self.second = False
+                    self._pending_name_user_id = None
+                    self._name_extract_attempts = 0
+                else:
+                    logger.info(
+                        "姓名抽取尝试 %d/%d，若本次失败下一轮将继续抽取",
+                        self._name_extract_attempts,
+                        self.max_name_extract_attempts,
+                    )
 
         # user_id 切换检测：若在等待提取姓名阶段 user_id 已切换，放弃本次提取并重置，
         # 以便新顾客先走正常询问姓名流程，下一轮再提取
-        if self.second_ask and vid != self._pending_name_user_id:
+        # （仅主对话轮检测；抽取调用可能不携带 vid，不应触发误判）
+        if not is_obtain_name and self.second_ask and vid != self._pending_name_user_id:
             logger.info(
                 "user_id 已切换（%s -> %s），放弃上一轮姓名提取，将对新顾客重新询问姓名",
                 self._pending_name_user_id,
@@ -550,8 +599,9 @@ class RAGService:
             )
             self.second_ask = False
             self.second = False
+            self._name_extract_attempts = 0
 
-        if self.second_ask:
+        if self.second_ask and not is_obtain_name:
             self.second = True
 
         timings = {}
@@ -636,22 +686,26 @@ class RAGService:
                     )
             robot_location_tags = list(self._robot_location_tags)
 
-        prompt = build_prompt(
-            raw_query,
-            context,
-            vision_user_id=vision_user_id,
-            vision_user_name=resolved_name,
-            voice_user_id=voice_user_id,
-            visit_locations=visit_locations,
-            should_ask_name=should_ask_name,
-            is_obtain_name=is_obtain_name,
-            is_active_ask=is_active_ask,
-            active_ask_stage_hint=active_ask_stage_hint,
-            robot_location_tags=robot_location_tags,
-            active_tags=resolved_tags,
-            greeting_location_tag=self.greeting_location_tag,
-            greeting_location_label=self.greeting_location_label,
-        )
+        if is_obtain_name and rule_extracted_name:
+            # 规则已确定姓名：LLM 仅需原样回显，保持「抽取调用返回姓名」的接口契约
+            prompt = build_echo_name_prompt(rule_extracted_name)
+        else:
+            prompt = build_prompt(
+                raw_query,
+                context,
+                vision_user_id=vision_user_id,
+                vision_user_name=resolved_name,
+                voice_user_id=voice_user_id,
+                visit_locations=visit_locations,
+                should_ask_name=should_ask_name,
+                is_obtain_name=is_obtain_name,
+                is_active_ask=is_active_ask,
+                active_ask_stage_hint=active_ask_stage_hint,
+                robot_location_tags=robot_location_tags,
+                active_tags=resolved_tags,
+                greeting_location_tag=self.greeting_location_tag,
+                greeting_location_label=self.greeting_location_label,
+            )
         timings["build_context_prompt"] = time.perf_counter() - t2
         timings["total"] = (
             timings["retrieve"] + timings["rerank"] + timings["build_context_prompt"]
@@ -681,6 +735,7 @@ class RAGService:
             "prompt": prompt,
             "timings": timings,
             "second": self.second,
+            "rule_extracted_name": rule_extracted_name,
             "active_tags": resolved_tags,
             "is_active_ask": is_active_ask,
             "vision_user_id": vid,

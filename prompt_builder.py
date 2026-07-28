@@ -224,6 +224,26 @@ def _resolve_single_vehicle_tag(
     return unique[0] if len(unique) == 1 else None
 
 
+def _build_factual_accuracy_lines() -> str:
+    """引导 LLM 严守资料边界，禁止凭营销话术或常识推断配置事实。"""
+    return (
+        "【事实准确性 — 全车型配置】\n"
+        "回答任何车型的价格、续航、加速、座位数、座椅加热/通风/按摩/4D、零重力、"
+        "空悬、冰箱、后排屏、智驾硬件等配置问题时，必须优先采信【资料】中含"
+        "「官方指导价」「参数表」「CLTC」「标配/选配/无」等结构化字段的内容。\n"
+        "当【资料】中营销话术写「全系」「标配」「全排」「前排+后排」等，"
+        "与同条或他处参数表字段（如「选配」「无」、未分列座位）冲突时，"
+        "必须以参数表为准，不得采信营销话术中的配置分布。\n"
+        "用户询问「哪些座椅/哪几个位置/标配还是选装」时，"
+        "必须仅在【资料】有明确座位、位置或参数表字段时作答；"
+        "禁止根据场景描述（如「妈妈久坐二排」）、功能泛述、同排类推或行业常识推断。\n"
+        "禁止把某一座椅的功能推广到同排其他座椅或其他排次；"
+        "禁止将5座车型说成有三排，或将「3个零重力座椅」说成「第三排零重力」。\n"
+        "若【资料】只介绍功能特点但未写明配备位置或版本，"
+        "只回答功能本身，并说明「具体以当前门店配置表为准」。\n"
+    )
+
+
 def _build_robot_capability_boundary_lines() -> str:
     """引导 LLM 区分机器人可执行能力与不可执行的物理/线下动作承诺。"""
     return (
@@ -416,9 +436,114 @@ _LOCATION_TAG_PATTERN = re.compile(r"<LOCATION>.*?</LOCATION>", re.DOTALL | re.I
 _SENTENCE_PUNCT_PATTERN = re.compile(r"[，。！？；：,\.!?;:]")
 _VALID_NAME_PATTERN = re.compile(r"^[\u4e00-\u9fff]{2,4}$")
 _NAME_INTRO_PREFIX_PATTERN = re.compile(
-    r"^(?:我?(?:叫|是|姓)|名字(?:叫|是)?|称呼(?:是|叫)?|大家都?(?:都)?叫我)\s*"
+    r"^(?:大家都?(?:都)?叫我|叫我|我?(?:叫|是|姓)|名字(?:叫|是)?|称呼(?:是|叫)?)\s*"
 )
 _NAME_SUFFIX_PARTICLES = "吧呢啊呀哦哈嘛"
+
+# 「姓氏+称谓」输出形式（如「刘先生」「王女士」），默认称谓为「先生」
+_HONORIFIC_SUFFIXES = ("先生", "女士", "小姐")
+_DEFAULT_HONORIFIC = "先生"
+
+# 常见复姓（「我姓欧阳」→「欧阳先生」）
+_COMPOUND_SURNAMES = frozenset(
+    {
+        "欧阳", "司马", "上官", "诸葛", "东方", "皇甫", "尉迟", "公孙",
+        "令狐", "慕容", "长孙", "宇文", "司徒", "司空", "夏侯", "独孤",
+        "南宫", "西门", "东郭", "百里", "呼延", "澹台", "端木", "申屠",
+    }
+)
+
+# 常见单字姓氏（现代常用姓氏 + 百家姓高频段），用于校验 LLM 只输出单个姓氏时的兜底转换
+_COMMON_SINGLE_SURNAMES = frozenset(
+    # 现代人口排名靠前的常用姓氏
+    "王李张刘陈杨黄赵吴周徐孙马朱胡郭何林罗高郑梁谢宋唐许韩冯邓曹彭曾"
+    "肖田董潘袁蔡蒋余于杜叶程魏苏吕丁任卢姚沈钟姜崔谭陆范汪廖石金韦贾"
+    "夏付方邹熊白孟秦邱侯江尹薛闫段雷龙黎史陶贺毛郝顾龚邵万覃武钱戴严"
+    "莫孔向汤常温康施牛樊葛邢路岳齐易伍乔贲庞倪"
+    # 百家姓高频段补充
+    "褚卫尤华陶戚喻柏水窦章云奚郎鲁昌苗凤花俞柳酆鲍费廉岑滕殷毕邬安乐"
+    "时傅皮卞元卜平和穆湛祁禹狄米贝明臧计伏成谈茅纪舒屈项祝阮蓝闵席季"
+    "麻娄危童颜梅盛刁骆凌霍虞支柯昝管经房裘缪干解应宗宣郁单杭洪包诸左"
+    "吉钮"
+)
+
+# 姓名主体中不应出现的虚词/代词/否定词/常见动词（防止「我叫不出来」误抽为「不出来」）
+_NAME_STOPCHARS = set(
+    "的了吗呢吧啊呀哦哈嘛不没啥谁这那它他她你我您和跟与什么怎么去来到看走"
+)
+
+# 规则抽取：高置信「报全名」引导词（刻意排除歧义大的「我是」，交给 LLM 兜底）
+# 允许捕获 1 字：如「我叫刘」只留下姓氏时按「姓氏+先生」处理
+_FULLNAME_INTRO_PATTERN = re.compile(
+    r"(?:我叫|叫我|我名叫|名字(?:叫|是))\s*([\u4e00-\u9fff]{1,4})"
+)
+
+# 规则抽取：「只报姓氏」引导词（我姓刘 / 免贵姓王 / 敝姓张）
+_SURNAME_INTRO_PATTERN = re.compile(
+    r"(?:我姓|免贵姓|敝姓|本人姓|鄙人姓)\s*([\u4e00-\u9fff]{1,2})"
+)
+
+
+def _is_plausible_name_chars(text: str) -> bool:
+    """姓名主体不应包含虚词、代词、否定词等停止字符。"""
+    return bool(text) and not any(ch in _NAME_STOPCHARS for ch in text)
+
+
+def extract_name_by_rules(text: Optional[str]) -> str:
+    """
+    规则版姓名抽取：LLM 调用前的确定性快速路径。
+
+    仅处理高置信模式，命中即返回，未命中返回空字符串交由 LLM 抽取：
+    - 「我叫张三 / 叫我张三 / 名字叫张三」 → 张三
+    - 「我姓刘 / 免贵姓王」 → 刘先生（复姓如「我姓欧阳」→ 欧阳先生）
+    """
+    if not text:
+        return ""
+    utterance = str(text).strip()
+    if not utterance:
+        return ""
+
+    # 1) 报全名模式
+    match = _FULLNAME_INTRO_PATTERN.search(utterance)
+    if match:
+        candidate = match.group(1).rstrip(_NAME_SUFFIX_PARTICLES)
+        if _is_plausible_name_chars(candidate):
+            if len(candidate) == 1:
+                # 「我叫刘」等只留下单字时按姓氏处理
+                return f"{candidate}{_DEFAULT_HONORIFIC}"
+            if 2 <= len(candidate) <= 4:
+                return candidate
+
+    # 2) 只报姓氏模式 → 姓氏+先生
+    match = _SURNAME_INTRO_PATTERN.search(utterance)
+    if match:
+        candidate = match.group(1).rstrip(_NAME_SUFFIX_PARTICLES)
+        if candidate in _COMPOUND_SURNAMES:
+            return f"{candidate}{_DEFAULT_HONORIFIC}"
+        surname = candidate[:1]
+        if surname and _is_plausible_name_chars(surname):
+            return f"{surname}{_DEFAULT_HONORIFIC}"
+
+    return ""
+
+
+def _normalize_honorific_name(name: str) -> Optional[str]:
+    """
+    处理「姓氏+称谓」形式（刘先生/王女士/欧阳先生）。
+
+    返回 None 表示不含称谓后缀（交由普通姓名校验）；
+    返回空字符串表示含称谓但主体无效；否则返回规范化后的「主体+称谓」。
+    """
+    for suffix in _HONORIFIC_SUFFIXES:
+        if name.endswith(suffix):
+            base = name[: -len(suffix)]
+            if (
+                re.fullmatch(r"[\u4e00-\u9fff]{1,4}", base)
+                and _is_plausible_name_chars(base)
+            ):
+                return base + suffix
+            return ""
+    return None
 
 
 def _strip_name_affixes(text: str) -> str:
@@ -438,15 +563,19 @@ def _looks_like_name_refusal(text: str) -> bool:
         return True
     if any(keyword in text for keyword in _EXTRACT_NAME_REFUSAL_KEYWORDS):
         return True
-    if len(re.findall(r"[\u4e00-\u9fff]", text)) > 4:
+    # 全名最长 4 字，「姓氏+称谓」形式最长 6 字（如「欧阳先生」「叫我刘先生」剥前缀前）
+    if len(re.findall(r"[\u4e00-\u9fff]", text)) > 6:
         return True
     return False
 
 
 def sanitize_extracted_name(raw: str | None) -> str:
     """
-    清洗 LLM 姓名抽取结果：仅当输出为（或剥离前后缀后为）2–4 个连续汉字人名时返回；
-    拒答句、解释句、问候语等均返回空字符串。
+    清洗 LLM 姓名抽取结果：
+    - 2–4 个连续汉字人名（可剥离「我叫/叫我/姓」等前后缀）原样返回；
+    - 「姓氏+先生/女士/小姐」形式（如「刘先生」「欧阳先生」）规范化后返回；
+    - 只输出单个常见姓氏时（如「刘」）自动转换为「刘先生」；
+    - 拒答句、解释句、问候语等均返回空字符串。
     """
     if raw is None:
         return ""
@@ -464,6 +593,18 @@ def sanitize_extracted_name(raw: str | None) -> str:
     name = _strip_name_affixes(text)
     if not name or name.lower() in _EXTRACT_NAME_EMPTY_TOKENS or name in _EXTRACT_NAME_EMPTY_TOKENS:
         return ""
+
+    # 「姓氏+称谓」形式：如「刘先生」「王女士」，主体有效则保留称谓返回
+    honorific_name = _normalize_honorific_name(name)
+    if honorific_name is not None:
+        return honorific_name
+
+    # 只输出单个姓氏时（如「刘」），按「姓氏+先生」兜底（仅限常见姓氏，防止误判）
+    if len(name) == 1:
+        if name in _COMMON_SINGLE_SURNAMES:
+            return f"{name}{_DEFAULT_HONORIFIC}"
+        return ""
+
     if not _VALID_NAME_PATTERN.fullmatch(name):
         return ""
     if not is_concrete_person_name(name):
@@ -558,10 +699,12 @@ def _build_obtain_name_prompt(query: str) -> str:
         "本任务与展厅介绍、意图状态、RAG 资料无关。\n"
         "\n"
         "【输出契约 — 违反任意一条即错误】\n"
-        "1. 只输出一行纯文本：要么是姓名本身，要么是空行（零字符，不要输出任何可见字符）。\n"
+        "1. 只输出一行纯文本：要么是姓名（或「姓氏+先生」），要么是空行（零字符，不要输出任何可见字符）。\n"
         "2. 禁止输出：<INTENT>、<LOCATION>、书名号、引号、冒号、解释、道歉、问候、"
         "「无法确定」「无」「不知道」、<EMPTY>、JSON、英文或其他任何附加内容。\n"
         "3. 姓名规则：2–4 个连续汉字，为人名用字；可去掉「我叫/叫我/是/姓」等前缀后只保留姓名。\n"
+        "   特别地：若访客只告知姓氏而未报全名（如「我姓刘」「免贵姓王」），"
+        "必须输出「姓氏+先生」，例如「刘先生」「王先生」；复姓同理（「我姓欧阳」→「欧阳先生」）。\n"
         "4. 以下情况必须输出空行（零字符）：\n"
         "   - 未提供姓名、拒绝透露、含糊其辞\n"
         "   - 仅寒暄/打招呼/呼叫机器人（如「你好」「小特」）\n"
@@ -577,6 +720,15 @@ def _build_obtain_name_prompt(query: str) -> str:
         "\n"
         "待分析文本：我姓李，名四是四行的四\n"
         "期望输出：李四\n"
+        "\n"
+        "待分析文本：我姓刘\n"
+        "期望输出：刘先生\n"
+        "\n"
+        "待分析文本：免贵姓王\n"
+        "期望输出：王先生\n"
+        "\n"
+        "待分析文本：我姓欧阳\n"
+        "期望输出：欧阳先生\n"
         "\n"
         "待分析文本：不想告诉你我的名字\n"
         "期望输出：\n"
@@ -594,6 +746,27 @@ def _build_obtain_name_prompt(query: str) -> str:
         "请只输出姓名或空行："
     )
     return template.format(utterance_block=utterance_block)
+
+
+def build_echo_name_prompt(person_name: str) -> str:
+    """
+    规则快速路径命中姓名后的「原样回显」专用提示词。
+
+    姓名已由 extract_name_by_rules 确定（并写入用户状态），
+    LLM 仅需原样输出该姓名，以保持「抽取调用返回姓名」的接口契约不变。
+    """
+    name = (person_name or "").strip()
+    return (
+        "【最高优先级 — 固定输出（非对话）】\n"
+        "本次任务只有一个要求：只输出下面「目标内容」本身，"
+        "不要添加任何其他字符、标点、引号、标签或解释。\n"
+        "禁止输出 <INTENT>、<LOCATION> 等任何状态标签"
+        "（本段要求覆盖默认系统提示中的状态标签规则）。\n"
+        "\n"
+        f"【目标内容】\n{name}\n"
+        "\n"
+        f"请只输出：{name}"
+    )
 
 
 def build_prompt(
@@ -655,6 +828,7 @@ def build_prompt(
 
     history_usage_line = _build_conversation_history_usage_lines()
     capability_boundary_line = _build_robot_capability_boundary_lines()
+    factual_accuracy_line = _build_factual_accuracy_lines()
     natural_oral_style_line = _build_natural_oral_style_lines()
 
     base_instruction = (
@@ -665,8 +839,9 @@ def build_prompt(
         "如果【资料】没有精确数值或某一版本的细项，不要直接输出「抱歉」「无法回答」「资料不足」；"
         "应先说明已知的相关信息，再用「具体以当前门店配置表为准」等方式弱化未知细节。"
         "只有当问题完全脱离车辆、品牌、导购和展厅范围，且会话历史也无法补足主语时，才简短说明暂时无法确认。\n"
-        "如果【资料】中的内容不足以回答问题，则结合会话中的历史 HumanMessage/AIMessage 推测问题主语，"
-        "并结合【资料】中的内容回答问题。\n"
+        "如果【资料】中的内容不足以完整回答问题，可结合会话历史推测问题主语（如车型、功能名称），"
+        "但不得据此编造【资料】未写明的配置分布、数量、参数或政策；"
+        "对未写明部分必须用「具体以当前门店配置表为准」等方式处理，不得凭猜测补全。\n"
     )
 
     if detected_location:
@@ -678,7 +853,7 @@ def build_prompt(
 
     closing = (
         "请基于【资料】输出完整回答。吸收【资料】中的事实信息与导购意图，"
-        "按【机器人能力边界】和【输出风格 — 自然口语】改写后作答，使得回答丰富且有深度。"
+        "按【机器人能力边界】【事实准确性 — 全车型配置】和【输出风格 — 自然口语】改写后作答，使得回答丰富且有深度。"
         + f"并按照【意图状态】要求输出 <INTENT> 标签{location_reminder}："
     )
 
@@ -687,6 +862,7 @@ def build_prompt(
         "{base_instruction}\n"
         "\n"
         "{capability_boundary_line}\n"
+        "{factual_accuracy_line}\n"
         "{natural_oral_style_line}\n"
         "{history_usage_line}\n"
         "{user_line}\n"
@@ -705,6 +881,7 @@ def build_prompt(
     return prompt.format(
         base_instruction=base_instruction,
         capability_boundary_line=capability_boundary_line,
+        factual_accuracy_line=factual_accuracy_line,
         natural_oral_style_line=natural_oral_style_line,
         history_usage_line=history_usage_line,
         user_line=user_line,
