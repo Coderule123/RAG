@@ -35,12 +35,13 @@ from RAG.config.config_runtime import load_config
 from RAG.config.hf_runtime import setup_huggingface_env
 from RAG.config.logger_runtime import get_logger, setup_logging
 from RAG.DP.document_loader import (
-    LOADER_BY_SUFFIX,
+    SUPPORTED_SUFFIXES,
     canonical_source_path,
     compute_file_hash,
-    get_loader,
     load_documents,
+    load_docx_documents,
     load_hash_registry,
+    load_pdf_documents,
     normalize_source_key,
     resolve_doc_tag,
 )
@@ -48,7 +49,6 @@ from RAG.DP.embedding_service import EmbeddingService
 from RAG.DP.semantic_splitter import split_documents
 from RAG.DP.vector_store import VectorStore
 
-SUPPORTED_SUFFIXES = set(LOADER_BY_SUFFIX.keys())
 MAX_PREVIEW_BYTES = 512 * 1024
 MAX_PREVIEW_CHARS = 120_000
 
@@ -99,7 +99,120 @@ def resolve_config_paths(config: dict) -> dict[str, Path]:
         "data_dir": Path(paths.get("data_dir", "./RAG/assets/data")).expanduser().resolve(),
         "index_dir": Path(paths.get("index_dir", "./RAG/assets/index_store")).expanduser().resolve(),
         "doc_logs_dir": Path(paths.get("doc_logs_dir", "./RAG/logs/doc")).expanduser().resolve(),
+        "visitor_state_dir": Path(
+            paths.get("visitor_state_dir", "./RAG/assets/visitor_states")
+        )
+        .expanduser()
+        .resolve(),
     }
+
+
+def iso_ts(ts: Any) -> Optional[str]:
+    if not isinstance(ts, (int, float)):
+        return None
+    return datetime.fromtimestamp(float(ts)).isoformat(timespec="seconds")
+
+
+def safe_visitor_path(states_dir: Path, face_id: str) -> Path:
+    if not face_id or "/" in face_id or "\\" in face_id or ".." in face_id:
+        raise ValueError("invalid face id")
+    file_path = (states_dir / f"{face_id}.json").resolve()
+    states_root = states_dir.resolve()
+    if file_path.parent != states_root:
+        raise ValueError("invalid visitor path")
+    return file_path
+
+
+def _build_step_view(steps: list) -> tuple[list[dict[str, Any]], Optional[dict], int, bool]:
+    """Normalize tour steps and compute current / progress."""
+    normalized: list[dict[str, Any]] = []
+    for raw in steps:
+        if not isinstance(raw, dict) or not raw.get("id"):
+            continue
+        normalized.append(
+            {
+                "id": str(raw["id"]),
+                "title": str(raw.get("title") or raw["id"]),
+                "order": int(raw.get("order") or 0),
+                "asked": bool(raw.get("asked", False)),
+                "asked_at": iso_ts(raw.get("asked_at")),
+            }
+        )
+    normalized.sort(key=lambda s: s["order"])
+
+    current_step: Optional[dict] = None
+    for step in normalized:
+        if not step["asked"]:
+            current_step = {
+                "id": step["id"],
+                "title": step["title"],
+                "order": step["order"],
+            }
+            break
+
+    for step in normalized:
+        if step["asked"]:
+            step["status"] = "done"
+        elif current_step and step["id"] == current_step["id"]:
+            step["status"] = "current"
+        else:
+            step["status"] = "pending"
+
+    asked_count = sum(1 for step in normalized if step["asked"])
+    all_done = bool(normalized) and current_step is None
+    return normalized, current_step, asked_count, all_done
+
+
+def summarize_visitor_state(raw: dict, face_id: str, mtime: float) -> dict[str, Any]:
+    tour = raw.get("tour_process") if isinstance(raw.get("tour_process"), dict) else {}
+    steps, current_step, asked_count, all_done = _build_step_view(
+        tour.get("steps") if isinstance(tour.get("steps"), list) else []
+    )
+    ask_name = raw.get("ask_name") if isinstance(raw.get("ask_name"), dict) else {}
+    person_name = raw.get("person_name")
+    return {
+        "face_id": str(raw.get("vision_user_id") or face_id),
+        "person_name": str(person_name) if person_name else None,
+        "ask_name_asked": bool(ask_name.get("asked", False)),
+        "ask_name_first_asked_at": iso_ts(ask_name.get("first_asked_at")),
+        "current_vehicle_tag": str(tour.get("current_vehicle_tag") or "") or None,
+        "asked_count": asked_count,
+        "total_steps": len(steps),
+        "current_step": current_step,
+        "all_done": all_done,
+        "created_at": iso_ts(raw.get("created_at")),
+        "updated_at": iso_ts(raw.get("updated_at")) or iso_mtime(mtime),
+        "mtime": iso_mtime(mtime),
+    }
+
+
+def load_visitor_detail(raw: dict, face_id: str, mtime: float) -> dict[str, Any]:
+    summary = summarize_visitor_state(raw, face_id, mtime)
+    tour = raw.get("tour_process") if isinstance(raw.get("tour_process"), dict) else {}
+    steps, _, _, _ = _build_step_view(
+        tour.get("steps") if isinstance(tour.get("steps"), list) else []
+    )
+    summary["steps"] = steps
+    return summary
+
+
+def list_visitors(states_dir: Path) -> list[dict[str, Any]]:
+    visitors: list[dict[str, Any]] = []
+    if not states_dir.exists():
+        return visitors
+    for item in states_dir.iterdir():
+        if not item.is_file() or item.suffix != ".json":
+            continue
+        face_id = item.stem
+        try:
+            raw = json.loads(item.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(raw, dict):
+            continue
+        visitors.append(summarize_visitor_state(raw, face_id, item.stat().st_mtime))
+    visitors.sort(key=lambda x: x.get("updated_at") or "", reverse=True)
+    return visitors
 
 
 def list_data_files(data_dir: Path, index_dir: Path) -> list[dict[str, Any]]:
@@ -291,10 +404,11 @@ def read_data_file_preview(data_dir: Path, relpath: str) -> dict[str, Any]:
         }
 
     if suffix in (".pdf", ".docx"):
-        loader = get_loader(file_path)
-        if loader is None or loader == "json":
-            raise ValueError(f"unsupported preview type: {suffix}")
-        docs = loader.load()
+        file_hash = compute_file_hash(file_path)
+        if suffix == ".pdf":
+            docs = load_pdf_documents(file_path, file_hash)
+        else:
+            docs = load_docx_documents(file_path, file_hash)
         parts: list[str] = []
         total_len = 0
         for i, doc in enumerate(docs):
@@ -707,9 +821,52 @@ class RagAdminHandler(BaseHTTPRequestHandler):
                     "data_dir": str(paths["data_dir"]),
                     "index_dir": str(paths["index_dir"]),
                     "doc_logs_dir": str(paths["doc_logs_dir"]),
+                    "visitor_state_dir": str(paths["visitor_state_dir"]),
                     "html_path": str(self._html_path()),
                     "js_path": str(self._js_path()),
                 }
+            )
+            return
+
+        if path == "/api/visitors":
+            states_dir = paths["visitor_state_dir"]
+            self._send_json(
+                {
+                    "visitors": list_visitors(states_dir),
+                    "visitor_state_dir": str(states_dir),
+                }
+            )
+            return
+
+        if len(parts) == 3 and parts[0] == "api" and parts[1] == "visitors":
+            face_id = parts[2]
+            try:
+                file_path = safe_visitor_path(paths["visitor_state_dir"], face_id)
+            except ValueError as e:
+                self._send_json({"error": str(e)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            if not file_path.is_file():
+                self._send_json(
+                    {"error": f"visitor not found: {face_id}"},
+                    status=HTTPStatus.NOT_FOUND,
+                )
+                return
+            try:
+                raw = json.loads(file_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError) as e:
+                self._send_json(
+                    {"error": f"failed to read visitor state: {e}"},
+                    status=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                return
+            if not isinstance(raw, dict):
+                self._send_json(
+                    {"error": "invalid visitor state format"},
+                    status=HTTPStatus.INTERNAL_SERVER_ERROR,
+                )
+                return
+            self._send_json(
+                load_visitor_detail(raw, face_id, file_path.stat().st_mtime)
             )
             return
 
@@ -1021,6 +1178,7 @@ def main() -> None:
     paths["data_dir"].mkdir(parents=True, exist_ok=True)
     paths["index_dir"].mkdir(parents=True, exist_ok=True)
     paths["doc_logs_dir"].mkdir(parents=True, exist_ok=True)
+    paths["visitor_state_dir"].mkdir(parents=True, exist_ok=True)
 
     html_path = Path(args.html_path).expanduser().resolve()
     js_path = Path(args.js_path).expanduser().resolve()
@@ -1036,6 +1194,7 @@ def main() -> None:
     print(f"[rag-web] serving on http://{args.host}:{args.port}")
     print(f"[rag-web] data dir: {paths['data_dir']}")
     print(f"[rag-web] index dir: {paths['index_dir']}")
+    print(f"[rag-web] visitor state dir: {paths['visitor_state_dir']}")
     print(f"[rag-web] html path: {html_path}")
     print(f"[rag-web] js path: {js_path}")
 

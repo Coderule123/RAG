@@ -14,15 +14,20 @@
     logOffset: 0,
     logTimer: null,
     jobBusy: false,
+    visitors: [],
+    selectedVisitorId: null,
+    visitorDetail: null,
   };
 
   const els = {
     tabData: document.getElementById("tabData"),
     tabIndex: document.getElementById("tabIndex"),
     tabBuild: document.getElementById("tabBuild"),
+    tabVisitor: document.getElementById("tabVisitor"),
     dataPane: document.getElementById("dataPane"),
     indexPane: document.getElementById("indexPane"),
     buildPane: document.getElementById("buildPane"),
+    visitorPane: document.getElementById("visitorPane"),
     fileList: document.getElementById("fileList"),
     fileDetail: document.getElementById("fileDetail"),
     dataStatus: document.getElementById("dataStatus"),
@@ -46,6 +51,16 @@
     jobResult: document.getElementById("jobResult"),
     docLogViewer: document.getElementById("docLogViewer"),
     clearLogBtn: document.getElementById("clearLogBtn"),
+    visitorList: document.getElementById("visitorList"),
+    visitorDetail: document.getElementById("visitorDetail"),
+    visitorStatus: document.getElementById("visitorStatus"),
+    refreshVisitorBtn: document.getElementById("refreshVisitorBtn"),
+  };
+
+  const STEP_STATUS_LABEL = {
+    done: "已完成",
+    current: "进行中",
+    pending: "未开始",
   };
 
   const INDEX_STATUS_LABEL = {
@@ -86,15 +101,24 @@
     els.buildStatus.textContent = text;
   }
 
+  function setVisitorStatus(text) {
+    els.visitorStatus.textContent = text;
+  }
+
   function switchTab(tab) {
     state.activeTab = tab;
     const map = {
       data: [els.tabData, els.dataPane],
       index: [els.tabIndex, els.indexPane],
       build: [els.tabBuild, els.buildPane],
+      visitor: [els.tabVisitor, els.visitorPane],
     };
-    [els.tabData, els.tabIndex, els.tabBuild].forEach((el) => el.classList.remove("active"));
-    [els.dataPane, els.indexPane, els.buildPane].forEach((el) => el.classList.add("hidden"));
+    [els.tabData, els.tabIndex, els.tabBuild, els.tabVisitor].forEach((el) =>
+      el.classList.remove("active")
+    );
+    [els.dataPane, els.indexPane, els.buildPane, els.visitorPane].forEach((el) =>
+      el.classList.add("hidden")
+    );
     const pair = map[tab];
     if (pair) {
       pair[0].classList.add("active");
@@ -108,6 +132,7 @@
     } else {
       stopLogPolling();
     }
+    if (tab === "visitor") loadVisitors();
   }
 
   function renderTagSelect() {
@@ -617,12 +642,153 @@
     }
   }
 
+  function renderVisitorList() {
+    if (!state.visitors.length) {
+      els.visitorList.innerHTML = '<p style="color:var(--muted);padding:8px;">暂无访客状态</p>';
+      return;
+    }
+    els.visitorList.innerHTML = state.visitors
+      .map((v) => {
+        const active = state.selectedVisitorId === v.face_id;
+        const name = v.person_name || "未登记姓名";
+        const progress = `${v.asked_count || 0}/${v.total_steps || 0}`;
+        const currentTitle = v.all_done
+          ? "全部完成"
+          : (v.current_step && v.current_step.title) || "未开始";
+        return `
+          <div class="visitor-item ${active ? "active" : ""}" data-face-id="${escapeHtml(v.face_id)}">
+            <div class="name">
+              <span>人脸 ID: ${escapeHtml(v.face_id)}</span>
+              <span class="badge ${v.ask_name_asked ? "name-asked" : "name-pending"}">
+                ${v.ask_name_asked ? "已问姓名" : "未问姓名"}
+              </span>
+            </div>
+            <div class="meta">${escapeHtml(name)} · 进度 ${progress}</div>
+            <div class="meta">当前：${escapeHtml(currentTitle)}</div>
+          </div>`;
+      })
+      .join("");
+
+    els.visitorList.querySelectorAll(".visitor-item").forEach((node) => {
+      node.addEventListener("click", () => {
+        const faceId = node.getAttribute("data-face-id");
+        if (faceId) selectVisitor(faceId);
+      });
+    });
+  }
+
+  function renderVisitorDetail(detail) {
+    if (!detail) {
+      els.visitorDetail.innerHTML =
+        '<p style="color:var(--muted)">选择左侧人脸 ID 查看流程步骤</p>';
+      return;
+    }
+
+    const total = detail.total_steps || 0;
+    const asked = detail.asked_count || 0;
+    const pct = total ? Math.round((asked / total) * 100) : 0;
+    const currentLabel = detail.all_done
+      ? "全部完成"
+      : (detail.current_step && detail.current_step.title) || "未开始";
+    const steps = detail.steps || [];
+
+    const stepHtml = steps
+      .map((step) => {
+        const status = step.status || "pending";
+        const askedAt = step.asked_at ? `完成时间：${step.asked_at}` : "尚未完成";
+        return `
+          <div class="step-row">
+            <div class="step-rail">
+              <div class="step-dot ${status}"></div>
+              <div class="step-line"></div>
+            </div>
+            <div class="step-body ${status}">
+              <div class="step-title-row">
+                <div class="step-title">${escapeHtml(step.title || step.id)}</div>
+                <span class="badge ${status}">${STEP_STATUS_LABEL[status] || status}</span>
+              </div>
+              <div class="step-sub">id=${escapeHtml(step.id)} · order=${step.order ?? "—"} · ${escapeHtml(askedAt)}</div>
+            </div>
+          </div>`;
+      })
+      .join("");
+
+    els.visitorDetail.innerHTML = `
+      <div class="visitor-summary">
+        <div class="card"><div class="label">人脸 ID</div><div class="value" style="font-size:16px;">${escapeHtml(detail.face_id)}</div></div>
+        <div class="card"><div class="label">姓名</div><div class="value" style="font-size:16px;">${escapeHtml(detail.person_name || "未登记")}</div></div>
+        <div class="card"><div class="label">流程进度</div><div class="value">${asked}/${total}</div></div>
+        <div class="card"><div class="label">车型 Tag</div><div class="value" style="font-size:16px;">${escapeHtml(detail.current_vehicle_tag || "—")}</div></div>
+      </div>
+      <dl style="margin-bottom:16px;">
+        <dt>询问姓名</dt>
+        <dd>${detail.ask_name_asked ? "已询问" : "未询问"}${detail.ask_name_first_asked_at ? "（" + escapeHtml(detail.ask_name_first_asked_at) + "）" : ""}</dd>
+        <dt>当前步骤</dt>
+        <dd>${escapeHtml(currentLabel)}</dd>
+        <dt>更新时间</dt>
+        <dd>${escapeHtml(detail.updated_at || "—")}</dd>
+      </dl>
+      <div style="margin-bottom:8px;">
+        <strong style="font-size:13px;">流程步骤</strong>
+        <div class="progress-bar"><span style="width:${pct}%"></span></div>
+        <div class="step-sub">已完成 ${asked} / ${total}（${pct}%）</div>
+      </div>
+      <div class="step-timeline">${stepHtml || '<p style="color:var(--muted)">暂无步骤数据</p>'}</div>`;
+  }
+
+  async function selectVisitor(faceId) {
+    state.selectedVisitorId = faceId;
+    renderVisitorList();
+    try {
+      setVisitorStatus(`加载 ${faceId}…`);
+      const detail = await fetchJson(`/api/visitors/${encodeURIComponent(faceId)}`);
+      state.visitorDetail = detail;
+      renderVisitorDetail(detail);
+      const currentLabel = detail.all_done
+        ? "全部完成"
+        : (detail.current_step && detail.current_step.title) || "未开始";
+      setVisitorStatus(`人脸 ${faceId} · 当前：${currentLabel}`);
+    } catch (e) {
+      state.visitorDetail = null;
+      els.visitorDetail.innerHTML = `<p style="color:var(--danger)">加载失败: ${escapeHtml(e.message)}</p>`;
+      setVisitorStatus("加载失败: " + e.message);
+    }
+  }
+
+  async function loadVisitors() {
+    try {
+      setVisitorStatus("加载中…");
+      const data = await fetchJson("/api/visitors");
+      state.visitors = data.visitors || [];
+      renderVisitorList();
+      if (state.selectedVisitorId) {
+        const stillExists = state.visitors.some((v) => v.face_id === state.selectedVisitorId);
+        if (stillExists) {
+          await selectVisitor(state.selectedVisitorId);
+        } else {
+          state.selectedVisitorId = null;
+          state.visitorDetail = null;
+          renderVisitorDetail(null);
+          setVisitorStatus(`共 ${state.visitors.length} 位访客`);
+        }
+      } else if (state.visitors.length === 1) {
+        await selectVisitor(state.visitors[0].face_id);
+      } else {
+        setVisitorStatus(`共 ${state.visitors.length} 位访客`);
+      }
+    } catch (e) {
+      setVisitorStatus("加载失败: " + e.message);
+    }
+  }
+
   els.tabData.addEventListener("click", () => switchTab("data"));
   els.tabIndex.addEventListener("click", () => switchTab("index"));
   els.tabBuild.addEventListener("click", () => switchTab("build"));
+  els.tabVisitor.addEventListener("click", () => switchTab("visitor"));
   els.refreshDataBtn.addEventListener("click", loadDataFiles);
   els.uploadBtn.addEventListener("click", uploadFile);
   els.refreshIndexBtn.addEventListener("click", loadIndexData);
+  els.refreshVisitorBtn.addEventListener("click", loadVisitors);
   els.chunkFilter.addEventListener("input", () => {
     state.chunkFilter = els.chunkFilter.value;
     renderDocIndexList();
