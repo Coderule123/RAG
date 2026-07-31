@@ -163,11 +163,75 @@ def _build_step_view(steps: list) -> tuple[list[dict[str, Any]], Optional[dict],
     return normalized, current_step, asked_count, all_done
 
 
+def _build_interest_profile_view(raw_profile: Any) -> dict[str, Any]:
+    """Normalize interest_profile for web display."""
+    profile = raw_profile if isinstance(raw_profile, dict) else {}
+    last_tag = profile.get("last_vehicle_tag")
+    last_vehicle_tag = (
+        str(last_tag).strip().lower()
+        if isinstance(last_tag, str) and last_tag.strip()
+        else None
+    )
+
+    vehicles_out: list[dict[str, Any]] = []
+    vehicles_raw = profile.get("vehicles") if isinstance(profile.get("vehicles"), dict) else {}
+    for tag, info in vehicles_raw.items():
+        if not isinstance(tag, str) or not tag.strip() or not isinstance(info, dict):
+            continue
+        topics_raw = info.get("topics") if isinstance(info.get("topics"), dict) else {}
+        topics: list[dict[str, Any]] = []
+        for topic_id, topic_info in topics_raw.items():
+            if not isinstance(topic_id, str) or not topic_id.strip():
+                continue
+            if not isinstance(topic_info, dict):
+                continue
+            try:
+                count = max(1, int(topic_info.get("count", 1)))
+            except (TypeError, ValueError):
+                count = 1
+            topics.append(
+                {
+                    "id": topic_id.strip(),
+                    "title": str(topic_info.get("title") or topic_id),
+                    "count": count,
+                    "first_asked_at": iso_ts(topic_info.get("first_asked_at")),
+                    "last_asked_at": iso_ts(topic_info.get("last_asked_at")),
+                }
+            )
+        topics.sort(key=lambda t: (-t["count"], t["title"]))
+        try:
+            ask_count = max(1, int(info.get("ask_count", 1)))
+        except (TypeError, ValueError):
+            ask_count = 1
+        vehicles_out.append(
+            {
+                "tag": tag.strip().lower(),
+                "ask_count": ask_count,
+                "first_asked_at": iso_ts(info.get("first_asked_at")),
+                "last_asked_at": iso_ts(info.get("last_asked_at")),
+                "topic_count": len(topics),
+                "topics": topics,
+            }
+        )
+
+    vehicles_out.sort(
+        key=lambda v: (v.get("last_asked_at") or "", v.get("ask_count") or 0),
+        reverse=True,
+    )
+    return {
+        "last_vehicle_tag": last_vehicle_tag,
+        "vehicle_count": len(vehicles_out),
+        "topic_count": sum(v["topic_count"] for v in vehicles_out),
+        "vehicles": vehicles_out,
+    }
+
+
 def summarize_visitor_state(raw: dict, face_id: str, mtime: float) -> dict[str, Any]:
     tour = raw.get("tour_process") if isinstance(raw.get("tour_process"), dict) else {}
     steps, current_step, asked_count, all_done = _build_step_view(
         tour.get("steps") if isinstance(tour.get("steps"), list) else []
     )
+    interest = _build_interest_profile_view(raw.get("interest_profile"))
     ask_name = raw.get("ask_name") if isinstance(raw.get("ask_name"), dict) else {}
     person_name = raw.get("person_name")
     return {
@@ -175,11 +239,13 @@ def summarize_visitor_state(raw: dict, face_id: str, mtime: float) -> dict[str, 
         "person_name": str(person_name) if person_name else None,
         "ask_name_asked": bool(ask_name.get("asked", False)),
         "ask_name_first_asked_at": iso_ts(ask_name.get("first_asked_at")),
-        "current_vehicle_tag": str(tour.get("current_vehicle_tag") or "") or None,
         "asked_count": asked_count,
         "total_steps": len(steps),
         "current_step": current_step,
         "all_done": all_done,
+        "last_vehicle_tag": interest["last_vehicle_tag"],
+        "vehicle_count": interest["vehicle_count"],
+        "topic_count": interest["topic_count"],
         "created_at": iso_ts(raw.get("created_at")),
         "updated_at": iso_ts(raw.get("updated_at")) or iso_mtime(mtime),
         "mtime": iso_mtime(mtime),
@@ -193,6 +259,7 @@ def load_visitor_detail(raw: dict, face_id: str, mtime: float) -> dict[str, Any]
         tour.get("steps") if isinstance(tour.get("steps"), list) else []
     )
     summary["steps"] = steps
+    summary["interest_profile"] = _build_interest_profile_view(raw.get("interest_profile"))
     return summary
 
 

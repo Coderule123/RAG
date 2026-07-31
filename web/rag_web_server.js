@@ -17,6 +17,7 @@
     visitors: [],
     selectedVisitorId: null,
     visitorDetail: null,
+    visitorSubTab: "process",
   };
 
   const els = {
@@ -655,6 +656,9 @@
         const currentTitle = v.all_done
           ? "全部完成"
           : (v.current_step && v.current_step.title) || "未开始";
+        const vehicleHint = v.last_vehicle_tag
+          ? `最近车型 ${v.last_vehicle_tag}`
+          : `已询车型 ${v.vehicle_count || 0}`;
         return `
           <div class="visitor-item ${active ? "active" : ""}" data-face-id="${escapeHtml(v.face_id)}">
             <div class="name">
@@ -663,8 +667,9 @@
                 ${v.ask_name_asked ? "已问姓名" : "未问姓名"}
               </span>
             </div>
-            <div class="meta">${escapeHtml(name)} · 进度 ${progress}</div>
+            <div class="meta">${escapeHtml(name)} · 流程 ${progress}</div>
             <div class="meta">当前：${escapeHtml(currentTitle)}</div>
+            <div class="meta">${escapeHtml(vehicleHint)} · 关注点 ${v.topic_count || 0}</div>
           </div>`;
       })
       .join("");
@@ -677,13 +682,7 @@
     });
   }
 
-  function renderVisitorDetail(detail) {
-    if (!detail) {
-      els.visitorDetail.innerHTML =
-        '<p style="color:var(--muted)">选择左侧人脸 ID 查看流程步骤</p>';
-      return;
-    }
-
+  function renderProcessPanel(detail) {
     const total = detail.total_steps || 0;
     const asked = detail.asked_count || 0;
     const pct = total ? Math.round((asked / total) * 100) : 0;
@@ -713,27 +712,133 @@
       })
       .join("");
 
+    return `
+      <dl style="margin-bottom:16px;">
+        <dt>当前步骤</dt>
+        <dd>${escapeHtml(currentLabel)}</dd>
+        <dt>流程进度</dt>
+        <dd>已完成 ${asked} / ${total}（${pct}%）</dd>
+      </dl>
+      <div class="progress-bar"><span style="width:${pct}%"></span></div>
+      <div class="step-sub" style="margin:8px 0 12px;">导购流程各阶段</div>
+      <div class="step-timeline">${stepHtml || '<p style="color:var(--muted)">暂无步骤数据</p>'}</div>`;
+  }
+
+  function renderInterestPanel(detail) {
+    const profile = detail.interest_profile || {};
+    const vehicles = profile.vehicles || [];
+    const lastTag = profile.last_vehicle_tag || detail.last_vehicle_tag || null;
+
+    if (!vehicles.length) {
+      return `
+        <dl style="margin-bottom:12px;">
+          <dt>最近车型</dt>
+          <dd>${escapeHtml(lastTag || "暂无")}</dd>
+          <dt>已询车型</dt>
+          <dd>0</dd>
+        </dl>
+        <p style="color:var(--muted)">暂未识别到该访客询问过的车型或关注点</p>`;
+    }
+
+    const cards = vehicles
+      .map((vehicle) => {
+        const isLatest = lastTag && vehicle.tag === lastTag;
+        const topics = vehicle.topics || [];
+        const topicHtml = topics.length
+          ? topics
+              .map(
+                (topic) => `
+              <div class="topic-chip">
+                <div class="topic-title">${escapeHtml(topic.title || topic.id)}</div>
+                <div class="topic-count">询问 ${topic.count || 1} 次${
+                  topic.last_asked_at ? " · " + escapeHtml(topic.last_asked_at) : ""
+                }</div>
+              </div>`
+              )
+              .join("")
+          : '<span style="color:var(--muted);font-size:12px;">暂无关注点记录</span>';
+
+        return `
+          <div class="vehicle-card ${isLatest ? "latest" : ""}">
+            <div class="vehicle-card-header">
+              <div class="vehicle-card-title">${escapeHtml(vehicle.tag)}</div>
+              <div>
+                <span class="badge vehicle">询问 ${vehicle.ask_count || 1} 次</span>
+                <span class="badge topic">${vehicle.topic_count || 0} 个关注点</span>
+                ${isLatest ? '<span class="badge current">最近</span>' : ""}
+              </div>
+            </div>
+            <div class="vehicle-card-meta">
+              首次：${escapeHtml(vehicle.first_asked_at || "—")} ·
+              最近：${escapeHtml(vehicle.last_asked_at || "—")}
+            </div>
+            <div class="topic-chips">${topicHtml}</div>
+          </div>`;
+      })
+      .join("");
+
+    return `
+      <dl style="margin-bottom:16px;">
+        <dt>最近车型</dt>
+        <dd>${escapeHtml(lastTag || "—")}</dd>
+        <dt>已询车型</dt>
+        <dd>${vehicles.length} 个 · 关注点 ${profile.topic_count || 0} 个</dd>
+      </dl>
+      ${cards}`;
+  }
+
+  function bindVisitorSubTabs() {
+    els.visitorDetail.querySelectorAll(".visitor-sub-tab").forEach((btn) => {
+      btn.addEventListener("click", () => {
+        const sub = btn.getAttribute("data-sub");
+        if (!sub || sub === state.visitorSubTab) return;
+        state.visitorSubTab = sub;
+        renderVisitorDetail(state.visitorDetail);
+      });
+    });
+  }
+
+  function renderVisitorDetail(detail) {
+    if (!detail) {
+      els.visitorDetail.innerHTML =
+        '<p style="color:var(--muted)">选择左侧人脸 ID 查看访客流程与车型关注点</p>';
+      return;
+    }
+
+    const total = detail.total_steps || 0;
+    const asked = detail.asked_count || 0;
+    const vehicleCount =
+      (detail.interest_profile && detail.interest_profile.vehicle_count) ||
+      detail.vehicle_count ||
+      0;
+    const lastTag =
+      (detail.interest_profile && detail.interest_profile.last_vehicle_tag) ||
+      detail.last_vehicle_tag ||
+      "—";
+    const sub = state.visitorSubTab === "interest" ? "interest" : "process";
+    const panelHtml =
+      sub === "interest" ? renderInterestPanel(detail) : renderProcessPanel(detail);
+
     els.visitorDetail.innerHTML = `
       <div class="visitor-summary">
         <div class="card"><div class="label">人脸 ID</div><div class="value" style="font-size:16px;">${escapeHtml(detail.face_id)}</div></div>
         <div class="card"><div class="label">姓名</div><div class="value" style="font-size:16px;">${escapeHtml(detail.person_name || "未登记")}</div></div>
         <div class="card"><div class="label">流程进度</div><div class="value">${asked}/${total}</div></div>
-        <div class="card"><div class="label">车型 Tag</div><div class="value" style="font-size:16px;">${escapeHtml(detail.current_vehicle_tag || "—")}</div></div>
+        <div class="card"><div class="label">已询车型</div><div class="value" style="font-size:16px;">${escapeHtml(String(vehicleCount))}（${escapeHtml(lastTag)}）</div></div>
       </div>
-      <dl style="margin-bottom:16px;">
+      <dl style="margin-bottom:14px;">
         <dt>询问姓名</dt>
         <dd>${detail.ask_name_asked ? "已询问" : "未询问"}${detail.ask_name_first_asked_at ? "（" + escapeHtml(detail.ask_name_first_asked_at) + "）" : ""}</dd>
-        <dt>当前步骤</dt>
-        <dd>${escapeHtml(currentLabel)}</dd>
         <dt>更新时间</dt>
         <dd>${escapeHtml(detail.updated_at || "—")}</dd>
       </dl>
-      <div style="margin-bottom:8px;">
-        <strong style="font-size:13px;">流程步骤</strong>
-        <div class="progress-bar"><span style="width:${pct}%"></span></div>
-        <div class="step-sub">已完成 ${asked} / ${total}（${pct}%）</div>
+      <div class="visitor-sub-tabs">
+        <button type="button" class="visitor-sub-tab ${sub === "process" ? "active" : ""}" data-sub="process">访客流程</button>
+        <button type="button" class="visitor-sub-tab ${sub === "interest" ? "active" : ""}" data-sub="interest">车型关注点</button>
       </div>
-      <div class="step-timeline">${stepHtml || '<p style="color:var(--muted)">暂无步骤数据</p>'}</div>`;
+      <div id="visitorSubPanel">${panelHtml}</div>`;
+
+    bindVisitorSubTabs();
   }
 
   async function selectVisitor(faceId) {
@@ -747,7 +852,11 @@
       const currentLabel = detail.all_done
         ? "全部完成"
         : (detail.current_step && detail.current_step.title) || "未开始";
-      setVisitorStatus(`人脸 ${faceId} · 当前：${currentLabel}`);
+      const lastTag =
+        (detail.interest_profile && detail.interest_profile.last_vehicle_tag) ||
+        detail.last_vehicle_tag ||
+        "无";
+      setVisitorStatus(`人脸 ${faceId} · 流程：${currentLabel} · 最近车型：${lastTag}`);
     } catch (e) {
       state.visitorDetail = null;
       els.visitorDetail.innerHTML = `<p style="color:var(--danger)">加载失败: ${escapeHtml(e.message)}</p>`;

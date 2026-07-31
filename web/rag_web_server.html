@@ -494,6 +494,92 @@
     .badge.pending { background: #f3f4f6; color: #4b5563; }
     .badge.name-asked { background: #dbeafe; color: #1e40af; }
     .badge.name-pending { background: #fee2e2; color: #991b1b; }
+    .badge.vehicle { background: #e0e7ff; color: #3730a3; }
+    .badge.topic { background: #ecfdf5; color: #047857; }
+
+    .visitor-sub-tabs {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+      margin: 0 0 14px;
+    }
+
+    .visitor-sub-tab {
+      border: 1px solid var(--line);
+      background: #f8fafc;
+      color: var(--text);
+      border-radius: 10px;
+      padding: 9px 14px;
+      font-size: 13px;
+      font-weight: 600;
+      cursor: pointer;
+    }
+
+    .visitor-sub-tab:hover { border-color: #9cb3cc; }
+    .visitor-sub-tab.active {
+      border-color: var(--accent);
+      background: #ecfdf9;
+      box-shadow: 0 0 0 2px rgba(15, 118, 110, 0.12);
+    }
+
+    .vehicle-card {
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      padding: 12px;
+      background: #fafbfc;
+      margin-bottom: 12px;
+    }
+
+    .vehicle-card.latest {
+      border-color: #a5b4fc;
+      background: #eef2ff;
+    }
+
+    .vehicle-card-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-bottom: 8px;
+    }
+
+    .vehicle-card-title {
+      font-size: 15px;
+      font-weight: 700;
+    }
+
+    .vehicle-card-meta {
+      font-size: 11px;
+      color: var(--muted);
+      margin-bottom: 10px;
+    }
+
+    .topic-chips {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .topic-chip {
+      border: 1px solid #d1fae5;
+      background: #fff;
+      border-radius: 8px;
+      padding: 6px 10px;
+      font-size: 12px;
+      min-width: 88px;
+    }
+
+    .topic-chip .topic-title {
+      font-weight: 600;
+      color: var(--text);
+    }
+
+    .topic-chip .topic-count {
+      color: var(--muted);
+      margin-top: 2px;
+      font-size: 11px;
+    }
 
     .visitor-summary {
       display: grid;
@@ -625,14 +711,14 @@
   <div class="layout">
     <div class="header">
       <h1>RAG 知识库管理</h1>
-      <p>管理 data 文档、查看/删除向量索引、一键增量建库、查看访客流程进度</p>
+      <p>管理 data 文档、查看/删除向量索引、一键增量建库、查看访客信息</p>
     </div>
 
     <div class="tabs">
       <button class="tab active" id="tabData" type="button">文档管理</button>
       <button class="tab" id="tabIndex" type="button">向量数据</button>
       <button class="tab" id="tabBuild" type="button">建库</button>
-      <button class="tab" id="tabVisitor" type="button">访客流程</button>
+      <button class="tab" id="tabVisitor" type="button">访客信息</button>
     </div>
 
     <div class="tab-content">
@@ -711,11 +797,11 @@
         </div>
       </div>
 
-      <!-- Tab 4: Visitor process -->
+      <!-- Tab 4: Visitor info -->
       <div class="tab-pane hidden" id="visitorPane">
         <div class="panel">
           <div class="panel-header">
-            <h2>访客流程进度</h2>
+            <h2>访客信息</h2>
             <div class="toolbar">
               <button class="btn" id="refreshVisitorBtn" type="button">刷新</button>
             </div>
@@ -723,7 +809,7 @@
           <div class="split-layout">
             <div class="sidebar" id="visitorList"></div>
             <div class="detail" id="visitorDetail">
-              <p style="color:var(--muted)">选择左侧人脸 ID 查看流程步骤</p>
+              <p style="color:var(--muted)">选择左侧人脸 ID 查看访客流程与车型关注点</p>
             </div>
           </div>
           <div class="status" id="visitorStatus">就绪</div>
