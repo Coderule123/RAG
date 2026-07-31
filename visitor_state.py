@@ -85,6 +85,15 @@ def _empty_step(step_def: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def _empty_interest_profile() -> Dict[str, Any]:
+    """用户喜好感知：按车型记录询问过的关注点。"""
+    return {
+        "vehicles": {},
+        # 最近一次明确提到的车型，供后续「只问关注点、未提车型」时归属
+        "last_vehicle_tag": None,
+    }
+
+
 def _default_user_state(vision_id: str, tour_steps: List[Dict[str, Any]]) -> Dict[str, Any]:
     now = time.time()
     return {
@@ -94,14 +103,14 @@ def _default_user_state(vision_id: str, tour_steps: List[Dict[str, Any]]) -> Dic
         "updated_at": now,
         "ask_name": {"asked": False, "first_asked_at": None},
         "tour_process": {
-            "current_vehicle_tag": "ls6",
             "steps": [_empty_step(step) for step in tour_steps],
         },
+        "interest_profile": _empty_interest_profile(),
     }
 
 
 class VisitorStateStore:
-    """按 vision_user_id 独立维护用户状态文件，记录姓名询问与观车讲解进度。"""
+    """按 vision_user_id 独立维护用户状态：姓名、导购阶段进度、车型喜好感知。"""
 
     def __init__(
         self,
@@ -154,9 +163,6 @@ class VisitorStateStore:
                 state["ask_name"]["first_asked_at"] = float(first_asked_at)
 
         tour = raw.get("tour_process") if isinstance(raw.get("tour_process"), dict) else {}
-        if tour.get("current_vehicle_tag"):
-            state["tour_process"]["current_vehicle_tag"] = str(tour["current_vehicle_tag"])
-
         existing_steps = {
             step.get("id"): step
             for step in (tour.get("steps") or [])
@@ -173,7 +179,82 @@ class VisitorStateStore:
                     base["asked_at"] = float(asked_at)
             merged_steps.append(base)
         state["tour_process"]["steps"] = merged_steps
+        state["interest_profile"] = self._normalize_interest_profile(
+            raw.get("interest_profile")
+        )
         return state
+
+    @staticmethod
+    def _normalize_interest_profile(raw: Any) -> Dict[str, Any]:
+        profile = _empty_interest_profile()
+        if not isinstance(raw, dict):
+            return profile
+
+        last_tag = raw.get("last_vehicle_tag")
+        if isinstance(last_tag, str) and last_tag.strip():
+            profile["last_vehicle_tag"] = last_tag.strip().lower()
+
+        vehicles_raw = raw.get("vehicles")
+        if not isinstance(vehicles_raw, dict):
+            return profile
+
+        vehicles: Dict[str, Any] = {}
+        for tag, info in vehicles_raw.items():
+            if not isinstance(tag, str) or not tag.strip():
+                continue
+            if not isinstance(info, dict):
+                continue
+            norm_tag = tag.strip().lower()
+            topics_out: Dict[str, Any] = {}
+            topics_raw = info.get("topics") if isinstance(info.get("topics"), dict) else {}
+            for topic_id, topic_info in topics_raw.items():
+                if not isinstance(topic_id, str) or not topic_id.strip():
+                    continue
+                if not isinstance(topic_info, dict):
+                    continue
+                tid = topic_id.strip()
+                count = topic_info.get("count", 1)
+                try:
+                    count_i = max(1, int(count))
+                except (TypeError, ValueError):
+                    count_i = 1
+                entry = {
+                    "title": str(topic_info.get("title") or tid),
+                    "count": count_i,
+                    "first_asked_at": None,
+                    "last_asked_at": None,
+                }
+                for key in ("first_asked_at", "last_asked_at"):
+                    val = topic_info.get(key)
+                    if isinstance(val, (int, float)):
+                        entry[key] = float(val)
+                topics_out[tid] = entry
+
+            vehicle_entry = {
+                "ask_count": 1,
+                "first_asked_at": None,
+                "last_asked_at": None,
+                "topics": topics_out,
+            }
+            try:
+                vehicle_entry["ask_count"] = max(1, int(info.get("ask_count", 1)))
+            except (TypeError, ValueError):
+                vehicle_entry["ask_count"] = 1
+            for key in ("first_asked_at", "last_asked_at"):
+                val = info.get(key)
+                if isinstance(val, (int, float)):
+                    vehicle_entry[key] = float(val)
+            vehicles[norm_tag] = vehicle_entry
+
+        profile["vehicles"] = vehicles
+        if profile["last_vehicle_tag"] is None and vehicles:
+            # 无 last 标记时，取最近一次询问的车型
+            newest = max(
+                vehicles.items(),
+                key=lambda item: float(item[1].get("last_asked_at") or 0),
+            )
+            profile["last_vehicle_tag"] = newest[0]
+        return profile
 
     def _migrate_legacy_file_if_needed(self) -> None:
         """将旧版单文件 visitor_state.json 迁移为按用户独立文件。"""
@@ -213,10 +294,24 @@ class VisitorStateStore:
 
     def get_or_create(self, vision_id: str) -> Dict[str, Any]:
         path = self._state_path(vision_id)
-        state = self._normalize_state(vision_id, self._load_file(path))
+        raw = self._load_file(path)
+        state = self._normalize_state(vision_id, raw)
         if not path.exists():
             self._save_file(path, state)
             logger.info("新建用户状态文件: vision_user_id=%s path=%s", vision_id, path)
+        else:
+            # 兼容迁移：去掉已废弃的 current_vehicle_tag，并补齐 interest_profile
+            tour_raw = raw.get("tour_process") if isinstance(raw, dict) else None
+            needs_migrate = (
+                isinstance(tour_raw, dict) and "current_vehicle_tag" in tour_raw
+            ) or (isinstance(raw, dict) and "interest_profile" not in raw)
+            if needs_migrate:
+                self._save_file(path, state)
+                logger.info(
+                    "已迁移用户状态结构: vision_user_id=%s path=%s",
+                    vision_id,
+                    path,
+                )
         return state
 
     def save(self, vision_id: str, state: Dict[str, Any]) -> None:
@@ -348,9 +443,11 @@ class VisitorStateStore:
         vision_id: str,
         query: str = "",
         response: str = "",
+        vehicle_tags: Optional[List[str]] = None,
     ) -> List[str]:
         """
-        对 query + response 运行语言规则库，批量标记命中的观车环节。
+        对 query + response 运行语言规则库，批量标记命中的观车环节，
+        并同步更新用户喜好感知（询问过的车型与关注点）。
         返回本次新标记的 step_id 列表（已标记过的不重复计入）。
 
         典型用法：LLM 返回回复后调用一次，传入 (query, llm_response)。
@@ -368,7 +465,128 @@ class VisitorStateStore:
                 vision_id,
                 steps_summary(newly_marked),
             )
+        self.record_preferences_from_texts(
+            vision_id,
+            query=query,
+            response=response,
+            vehicle_tags=vehicle_tags,
+        )
         return newly_marked
+
+    def get_last_vehicle_tag(self, vision_id: str) -> Optional[str]:
+        state = self.get_or_create(vision_id)
+        profile = state.get("interest_profile") or {}
+        last = profile.get("last_vehicle_tag")
+        return str(last).strip().lower() if last else None
+
+    def record_preferences_from_texts(
+        self,
+        vision_id: str,
+        query: str = "",
+        response: str = "",
+        vehicle_tags: Optional[List[str]] = None,
+        fallback_vehicles: Optional[List[str]] = None,
+    ) -> Dict[str, List[str]]:
+        """
+        根据本轮对话更新喜好感知：记录询问过的车型，以及每个车型下的关注点。
+        返回本轮识别结果 {"vehicles": [...], "topics": [...]}。
+        """
+        from RAG.preference_rules import (
+            detect_preferences,
+            preferences_summary,
+            topic_title,
+        )
+
+        state = self.get_or_create(vision_id)
+        profile = state.setdefault("interest_profile", _empty_interest_profile())
+        if not isinstance(profile.get("vehicles"), dict):
+            profile["vehicles"] = {}
+
+        fallback = list(fallback_vehicles or [])
+        last_tag = profile.get("last_vehicle_tag")
+        if last_tag and last_tag not in fallback:
+            fallback.append(str(last_tag))
+
+        detected = detect_preferences(
+            query=query,
+            response=response,
+            vehicle_tags=vehicle_tags,
+            fallback_vehicles=fallback,
+        )
+        vehicles = detected.get("vehicles") or []
+        topics = detected.get("topics") or []
+        if not vehicles and not topics:
+            return detected
+
+        now = time.time()
+        vehicles_map: Dict[str, Any] = profile["vehicles"]
+        for tag in vehicles:
+            entry = vehicles_map.get(tag)
+            if not isinstance(entry, dict):
+                entry = {
+                    "ask_count": 0,
+                    "first_asked_at": now,
+                    "last_asked_at": now,
+                    "topics": {},
+                }
+                vehicles_map[tag] = entry
+            entry["ask_count"] = int(entry.get("ask_count") or 0) + 1
+            if not isinstance(entry.get("first_asked_at"), (int, float)):
+                entry["first_asked_at"] = now
+            entry["last_asked_at"] = now
+            if not isinstance(entry.get("topics"), dict):
+                entry["topics"] = {}
+
+            for topic_id in topics:
+                topic_entry = entry["topics"].get(topic_id)
+                if not isinstance(topic_entry, dict):
+                    topic_entry = {
+                        "title": topic_title(topic_id),
+                        "count": 0,
+                        "first_asked_at": now,
+                        "last_asked_at": now,
+                    }
+                    entry["topics"][topic_id] = topic_entry
+                topic_entry["title"] = topic_title(topic_id)
+                topic_entry["count"] = int(topic_entry.get("count") or 0) + 1
+                if not isinstance(topic_entry.get("first_asked_at"), (int, float)):
+                    topic_entry["first_asked_at"] = now
+                topic_entry["last_asked_at"] = now
+
+            profile["last_vehicle_tag"] = tag
+
+        # 仅命中关注点、无车型且无 fallback 时，暂不写入，避免无法归属
+        self.save(vision_id, state)
+        logger.info(
+            "喜好感知更新: vision_user_id=%s %s",
+            vision_id,
+            preferences_summary(vehicles, topics),
+        )
+        return detected
+
+    def get_interest_summary(self, vision_id: str) -> str:
+        """生成可读的喜好摘要，供日志/prompt 使用。"""
+        state = self.get_or_create(vision_id)
+        profile = state.get("interest_profile") or {}
+        vehicles = profile.get("vehicles") if isinstance(profile, dict) else {}
+        if not isinstance(vehicles, dict) or not vehicles:
+            return "喜好感知：暂无车型关注记录"
+
+        parts: List[str] = []
+        for tag, info in vehicles.items():
+            if not isinstance(info, dict):
+                continue
+            topics = info.get("topics") if isinstance(info.get("topics"), dict) else {}
+            titles = [
+                str(t.get("title") or tid)
+                for tid, t in topics.items()
+                if isinstance(t, dict)
+            ]
+            if titles:
+                parts.append(f"{tag}({ '、'.join(titles) })")
+            else:
+                parts.append(str(tag))
+        return "喜好感知：已关注 " + "；".join(parts)
 
     def get_state_file_path(self, vision_id: str) -> str:
         return str(self._state_path(vision_id))

@@ -539,11 +539,12 @@ class RAGService:
         if vid:
             user_state = self.visitor_state.get_or_create(vid)
             logger.info(
-                "用户状态: vision_user_id=%s vision_user_name=%s file=%s %s ask_name=%s person_name=%s",
+                "用户状态: vision_user_id=%s vision_user_name=%s file=%s %s %s ask_name=%s person_name=%s",
                 vid,
                 incoming_name,
                 self.visitor_state.get_state_file_path(vid),
                 self.visitor_state.get_tour_progress_summary(vid),
+                self.visitor_state.get_interest_summary(vid),
                 user_state.get("ask_name"),
                 user_state.get("person_name"),
             )
