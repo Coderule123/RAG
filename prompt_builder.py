@@ -64,47 +64,22 @@ def extract_visit_location(query: str,locations: Optional[List[str]] = None,) ->
         return None
     return ",".join(matched)
 
-def _build_intent_state_rules_block() -> str:
-    """
-    生成始终存在的【意图状态】输出契约。
-
-    与 orin.toml / 下游解析约定对齐：标签必须位于回复最开头，
-    以便 MOVE_TO_WAIT 等前缀匹配与流式切分生效。
-    """
-    return (
-        "【意图状态 — 强制输出格式】\n"
-        "每一条面向用户的回复都必须以状态标签开头；标签前不得有任何字符"
-        "（含空格、换行、标点、表情）。\n"
-        "正确格式：<INTENT>状态</INTENT>正文……\n"
-        "错误示例（禁止）：正文……<INTENT>状态</INTENT>\n"
-        "错误示例（禁止）：好的，<INTENT>状态</INTENT>……\n"
-        "可用状态：\n"
-        "- NEEDS_GUIDANCE：用户明确要参观/带看/逛展区\n"
-        "- MOVE_TO_WAIT：用户明确让机器人退下/不用了/回去充电\n"
-        "- INTERRUPT：用户明确要求打断/先停一下\n"
-        "- WAIT_FOR_TALK：普通对话或不确定时的默认状态\n"
-        "不确定时一律使用 WAIT_FOR_TALK。\n"
-        "严禁省略标签；严禁把标签放在句中或句末。\n"
-        "<LOCATION> 仅允许出现在【参观意向】明确给出预设地点时；"
-        "其余情况一律禁止输出 <LOCATION>。\n"
-    )
-
-
 def _build_intent_instruction_lines(
     query: str,
     locations: Optional[List[str]] = None,
 ) -> Tuple[str, Optional[str]]:
     """
-    生成意图与地点相关的输出格式说明。
-    返回 (instruction_text, detected_location)。
+    生成参观意向相关的动态约束块。
+    返回 (visit_block, detected_location)。
 
-    始终包含【意图状态】强制规则；参观意向时追加【参观意向】约束。
+    仅在检测到参观意向时追加【参观意向】约束（含或不含预设地点）；
+    无参观意向时返回空字符串。意图状态规则已在 default_system_prompt 中定义。
     """
     detected_location = extract_visit_location(query, locations)
-    intent_rules = _build_intent_state_rules_block()
+    visit_block = ""
 
     if detected_location:
-        intent_rules += (
+        visit_block = (
             f"【参观意向】用户问题已命中预设地点：{detected_location}。\n"
             f"若意图状态为 NEEDS_GUIDANCE，标签必须严格输出为 "
             f"<INTENT>NEEDS_GUIDANCE<LOCATION>{detected_location}</LOCATION></INTENT>，"
@@ -113,7 +88,7 @@ def _build_intent_instruction_lines(
         )
     elif is_visit_intent_query(query):
         loc_list = "、".join(locations or DEFAULT_VISIT_LOCATIONS)
-        intent_rules += (
+        visit_block = (
             "【参观意向】\n"
             "用户表达了参观/游览意向，但问题中未命中任何预设地点（"
             + loc_list
@@ -122,7 +97,7 @@ def _build_intent_instruction_lines(
             "严格禁止输出 <LOCATION> 标签，也禁止将用户话语中的任意文字作为地点值写入标签。\n"
         )
 
-    return intent_rules, detected_location
+    return visit_block, detected_location
 
 
 def resolve_pending_navigation_tags(
@@ -817,13 +792,17 @@ def build_prompt(
     greeting_location_label: str = DEFAULT_GREETING_LOCATION_LABEL,
 ) -> str:
     """
-    组装 RAG 提示词字符串，融合访客身份、意图状态与导航地点指令。
+    组装 RAG user-message 提示词字符串（不含固定系统规则）。
 
-    要求模型：
-    1. 基于【资料】回答问题，资料不足则说明“资料不足”。
-    2. 根据 vision_user_id（uuid）与 vision_user_name 调整称呼策略（voice_user_id 暂不处理）。
-    3. 根据用户问题判断意图状态，并在回答末尾附加 <INTENT>状态</INTENT>。
-    4. 参观意向且含具体地点时，在 <INTENT> 后附加 <LOCATION>地点</LOCATION>。
+    固定不变的内容（身份、语义完整度规则、意图标签定义、能力边界、
+    事实准确性、口语风格、对话历史用法）已写入 default_system_prompt，此处仅注入动态上下文：
+    1. 访客身份（vision_user_id / vision_user_name）
+    2. 机器人当前位置（robot_location_tags）
+    3. 单一车型口径（active_tags / robot_location_tags）
+    4. 参观意向 + 预设导航地点（query 中检测到参观意向时注入）
+    5. 本轮检索资料（context）+ 当前问题（query）
+
+    各块按"变化频率从小到大"排列，以最大化前缀缓存命中率。
     """
     if is_obtain_name:
         logger.info("构建姓名抽取专用 prompt")
@@ -838,42 +817,29 @@ def build_prompt(
         logger.info("构建询问姓名专用 prompt")
         return _build_ask_name_prompt(query)
 
+    # ── 动态块（变化从小到大排列，以最大化前缀缓存命中率） ──────────────
+    # 1. 访客身份：一次会话内相对固定，仅首次见面或姓名确认后变化
     user_line = _build_user_context_lines(
         vision_user_id=vision_user_id,
         should_ask_name=should_ask_name,
         vision_user_name=vision_user_name,
     )
+    # 2. 机器人位置：导航完成后变化，但一次导航期间保持不变
     robot_location_line = _build_robot_location_lines(
         robot_location_tags,
         greeting_location_tag=greeting_location_tag,
         greeting_location_label=greeting_location_label,
     )
+    # 3. 车型指代：由检索 tag 决定，同一展区问题期间保持不变
     vehicle_reference_line = _build_vehicle_reference_lines(
         active_tags=active_tags,
         robot_location_tags=robot_location_tags,
         greeting_location_tag=greeting_location_tag,
     )
-    intent_line, detected_location = _build_intent_instruction_lines(query, visit_locations)
+    # 4. 参观意向（含预设地点）：仅用户有参观意向时才注入，每次 query 可能不同
+    visit_line, detected_location = _build_intent_instruction_lines(query, visit_locations)
     if detected_location:
         logger.info("参观意向已识别地点: %s", detected_location)
-
-    history_usage_line = _build_conversation_history_usage_lines()
-    capability_boundary_line = _build_robot_capability_boundary_lines()
-    factual_accuracy_line = _build_factual_accuracy_lines()
-    natural_oral_style_line = _build_natural_oral_style_lines()
-
-    base_instruction = (
-        "基于【资料】回答问题，不要编造未经资料支持的具体价格、参数、配置或政策。\n"
-        "回答车型配置、功能和参数问题时，优先使用【资料】里的明确字段；如果用户问法较口语，"
-        "要把参数表字段转换成自然导购口径，例如把「近光灯/远光灯/自适应远近光/灯光特色功能」"
-        "整合回答为「车灯有哪些功能」。\n"
-        "如果【资料】没有精确数值或某一版本的细项，不要直接输出「抱歉」「无法回答」「资料不足」；"
-        "应先说明已知的相关信息，再用「具体以当前门店配置表为准」等方式弱化未知细节。"
-        "只有当问题完全脱离车辆、品牌、导购和展厅范围，且会话历史也无法补足主语时，才简短说明暂时无法确认。\n"
-        "如果【资料】中的内容不足以完整回答问题，可结合会话历史推测问题主语（如车型、功能名称），"
-        "但不得据此编造【资料】未写明的配置分布、数量、参数或政策；"
-        "对未写明部分必须用「具体以当前门店配置表为准」等方式处理，不得凭猜测补全。\n"
-    )
 
     if detected_location:
         location_reminder = (
@@ -882,24 +848,14 @@ def build_prompt(
     else:
         location_reminder = "（本次禁止输出 <LOCATION> 标签）" if is_visit_intent_query(query) else ""
 
-    closing = (
-        "请基于【资料】输出完整回答。吸收【资料】中的事实信息与导购意图，"
-        "按【机器人能力边界】【事实准确性 — 全车型配置】和【输出风格 — 自然口语】改写后作答，使得回答丰富且有深度。"
-        + f"并按照【意图状态】要求输出 <INTENT> 标签{location_reminder}："
-    )
+    closing = f"请严格以 <INTENT> 标签开头{location_reminder}，基于【资料】输出回答："
 
+    # 5. 检索资料 + 当前问题：每次 query 都变，放在最后
     template = (
-        "你是一个智能导购助手，你的名字叫小特。请严格遵循以下要求：\n"
-        "{base_instruction}\n"
-        "\n"
-        "{capability_boundary_line}\n"
-        "{factual_accuracy_line}\n"
-        "{natural_oral_style_line}\n"
-        "{history_usage_line}\n"
-        "{user_line}\n"
-        "{robot_location_line}\n"
-        "{vehicle_reference_line}\n"
-        "{intent_line}\n"
+        "{user_line}"
+        "{robot_location_line}"
+        "{vehicle_reference_line}"
+        "{visit_line}"
         "【资料】\n"
         "{context}\n"
         "\n"
@@ -910,15 +866,10 @@ def build_prompt(
     )
     prompt = ChatPromptTemplate.from_template(template)
     return prompt.format(
-        base_instruction=base_instruction,
-        capability_boundary_line=capability_boundary_line,
-        factual_accuracy_line=factual_accuracy_line,
-        natural_oral_style_line=natural_oral_style_line,
-        history_usage_line=history_usage_line,
         user_line=user_line,
         robot_location_line=robot_location_line,
         vehicle_reference_line=vehicle_reference_line,
-        intent_line=intent_line,
+        visit_line=visit_line,
         context=context,
         question=query,
         closing=closing,
