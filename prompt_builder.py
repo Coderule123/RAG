@@ -618,12 +618,122 @@ def sanitize_extracted_name(raw: str | None) -> str:
     return name
 
 
-def _build_active_ask_prompt(query: str, context: str, stage_hint: str = "") -> str:
+def _humanize_interest_for_prompt(interest_summary: str) -> str:
+    """把喜好摘要里的车型 tag 换成对外车型名，供主动招呼使用。"""
+    raw = (interest_summary or "").strip()
+    if not raw or "暂无" in raw:
+        return ""
+    text = raw.replace("喜好感知：", "").replace("已关注 ", "").strip()
+    for tag, display in VEHICLE_TAG_DISPLAY_NAMES.items():
+        text = re.sub(
+            rf"(?<![a-zA-Z0-9]){re.escape(tag)}(?![a-zA-Z0-9])",
+            display,
+            text,
+            flags=re.IGNORECASE,
+        )
+    return text
+
+
+def _build_active_ask_identity_lines(
+    person_name: Optional[str],
+    has_vision_id: bool,
+    is_new_visitor: bool,
+) -> str:
+    """主动招呼用的访客身份提示；不强制走询问姓名专用路径。"""
+    if person_name and is_concrete_person_name(person_name):
+        logger.info("主动招呼已知姓名: %s", person_name)
+        return (
+            "【访客身份】\n"
+            f"当前已知用户姓名是：{person_name}。"
+            "可在问候中适时、礼貌地称呼一次，不要每句重复。\n"
+        )
+    if has_vision_id:
+        logger.info("主动招呼已识别访客但未知姓名 new=%s", is_new_visitor)
+        extra = (
+            "本次以自然问候开场即可，不必强行询问姓名。\n"
+            if is_new_visitor
+            else "不要再次追问姓名。\n"
+        )
+        return (
+            "【访客身份】\n"
+            "已识别到同一位访客，但尚未获知真实姓名。"
+            "不要编造称呼，也不要把访客编号、时间戳或匿名 ID 读出来。"
+            + extra
+        )
+    return (
+        "【访客身份】\n"
+        "当前未识别到具体访客。按初次接触处理，不要编造姓名或编号。\n"
+    )
+
+
+def _build_active_ask_progress_lines(
+    progress: Optional[dict] = None,
+    has_vision_id: bool = False,
+) -> str:
+    """把按 uuid 读取的导购进度与喜好写成主动招呼约束。"""
+    if not has_vision_id:
+        return (
+            "【用户进展】\n"
+            "无视觉 ID，无法读取该访客的历史进度。按初次到店、尚未交流处理，"
+            "只做一句轻松自然的开场，不要假设对方已经看过某款车。\n"
+        )
+    data = progress if isinstance(progress, dict) else {}
+    done = [str(x).strip() for x in (data.get("done_titles") or []) if str(x).strip()]
+    pending = [str(x).strip() for x in (data.get("pending_titles") or []) if str(x).strip()]
+    current = str(data.get("current_step_title") or "").strip()
+    is_new = bool(data.get("is_new_visitor", not done))
+    interest = _humanize_interest_for_prompt(str(data.get("interest_summary") or ""))
+
+    done_text = "、".join(done) if done else "尚无（初次接触）"
+    current_text = current or "尚未锁定下一环节"
+    pending_text = "、".join(pending[:4]) if pending else "无"
+    if pending and len(pending) > 4:
+        pending_text += f" 等{len(pending)}项"
+
+    interest_line = (
+        f"已关注：{interest}。\n"
+        if interest
+        else "尚未记录明确的车型或配置关注点。\n"
+    )
+    visit_line = (
+        "这是该访客的初次主动接触，可以自然问候，但不要像第一次见面那样长篇自我介绍。\n"
+        if is_new
+        else "对方不是第一次交流：禁止再走一遍完整欢迎词，应简短承接后进入当前待推进环节。\n"
+    )
+    logger.info(
+        "主动招呼进展: new=%s done=%s current=%s interest=%s",
+        is_new,
+        done_text,
+        current_text,
+        interest or "(无)",
+    )
+    return (
+        "【用户进展 — 按该访客 uuid 读取，必须遵守】\n"
+        f"已完成：{done_text}\n"
+        f"当前应推进：{current_text}\n"
+        f"尚未开始：{pending_text}\n"
+        f"{interest_line}"
+        f"{visit_line}"
+        "选择下一句时：已完成阶段不要重复盘问；只围绕「当前应推进」问一个最缺的信息；"
+        "若已关注某款车或某个配置，用口语轻轻接住（例如「刚才您比较关心续航」），"
+        "不要说成系统记录或数据库。\n"
+    )
+
+
+def _build_active_ask_prompt(
+    query: str,
+    context: str,
+    stage_hint: str = "",
+    identity_block: str = "",
+    progress_block: str = "",
+    location_block: str = "",
+) -> str:
     """
     构建「主动询问顾客」专用提示词。
 
     场景：顾客无有效对话时由机器人先开口，或机器人主动推进导购流程。
-    stage_hint 由 RAGService 根据用户当前导购阶段注入，告知模型本轮应推进到哪个环节。
+    必须同时使用：按 uuid 恢复的历史 HumanMessage/AIMessage，以及【用户进展】中的阶段/喜好。
+    stage_hint 由 RAGService 根据用户当前导购阶段注入。
     """
     hint = (query or "").strip()
     hint_block = ""
@@ -643,31 +753,43 @@ def _build_active_ask_prompt(query: str, context: str, stage_hint: str = "") -> 
 
     context_block = (context or "").strip()
     if not context_block:
-        context_block = "（暂无检索到对应话术资料，请结合阶段目标用简短自然的口语开场。）"
+        context_block = "（暂无检索到对应话术资料，请结合阶段目标与用户进展用简短自然的口语开场。）"
 
     capability_boundary_line = _build_robot_capability_boundary_lines()
     natural_oral_style_line = _build_natural_oral_style_lines()
+    identity_line = (identity_block or "").strip()
+    progress_line = (progress_block or "").strip()
+    location_line = (location_block or "").strip()
 
     template = (
         "【最高优先级 — 主动发起对话（导购推进模式）】\n"
         "当前没有收到顾客的有效提问，由你主动开口。\n"
         "你的角色是展厅智能导购助手小特，像一位真人专业导购一样，"
         "自然、礼貌地引导顾客进入下一个体验环节。\n"
-        "当前会话上下文中已包含基于人脸 ID 恢复的历史 HumanMessage/AIMessage；"
-        "必须先阅读这些历史消息，判断顾客已经表达过的需求、疑虑、车型偏好、预算和体验反馈；"
-        "不要重复询问已经回答过的问题，应在【当前导购阶段目标】内选择最适合继续推进的一句主动询问或引导。\n"
         "\n"
+        "【对话历史 — 必须先读】\n"
+        "当前会话上下文中已包含基于该访客 uuid / 人脸 ID 恢复的历史 HumanMessage/AIMessage。"
+        "请先阅读这些消息，确认对方已经问过、确认过、拒绝过或听你讲过的内容。\n"
+        "历史非空时：不要重复已经回答过的问题，不要从「欢迎光临」重新开场；"
+        "用一句短承接（例如「您刚才比较关心……」）再进入【当前导购阶段目标】。\n"
+        "历史为空时：按【用户进展】判断是否初访，只做一句轻松开场，不要假装记得对方。\n"
+        "不要把历史来源说成数据库、记录或系统信息。\n"
+        "\n"
+        "{identity_line}\n"
+        "{progress_line}\n"
+        "{location_line}\n"
         "{capability_boundary_line}\n"
         "{natural_oral_style_line}\n"
         "【输出要求 — 必须全部遵守】\n"
         "1. 直接输出面向顾客的一句或两句中文口语，禁止输出 <INTENT>、<LOCATION> 等任何标签。\n"
-        "2. 必须结合【当前导购阶段目标】，让话语有明确的引导方向，而不是泛泛问候。\n"
-        "3. 必须结合会话中的历史 HumanMessage/AIMessage 选择最合适的下一问：缺什么问什么，已确认的内容只简短承接，不重复盘问。\n"
+        "2. 必须同时结合【对话历史】、【用户进展】和【当前导购阶段目标】："
+        "历史里已确认的只短承接，进展里已完成的不再盘问，只问当前阶段最缺的一个信息。\n"
+        "3. 禁止泛泛问候（如只说「您好请问有什么可以帮您」）；要让人听得出你记得对方进展或关注点。"
+        "若确无历史和进展，才允许一句简短欢迎并轻轻探问来意。\n"
         "4. 可参考【主动话术资料】中的风格与范例，但必须遵守【输出风格 — 自然口语】与【机器人能力边界】改写后输出。\n"
         "5. 禁止在回复中出现资料分类名、文件夹名、tag 名（如 active_ask、ls6 等）"
         "及「根据资料」「检索」等系统用语。\n"
-        "6. 若已知顾客姓名，可适当使用（如「张先生」），语气亲切自然；"
-        "未知姓名则不要臆造称呼，也不要重复询问。\n"
+        "6. 若【访客身份】已知姓名，可适当使用；未知则不要臆造称呼。\n"
         "7. 不要编造未经核实的价格、配置或政策数据。\n"
         "8. 控制在 80 字以内，亲切自然，不压迫，不过度推销。\n"
         "{stage_block}"
@@ -679,6 +801,9 @@ def _build_active_ask_prompt(query: str, context: str, stage_hint: str = "") -> 
         "请直接输出你对顾客说的引导语："
     )
     return template.format(
+        identity_line=identity_line,
+        progress_line=progress_line,
+        location_line=location_line,
         capability_boundary_line=capability_boundary_line,
         natural_oral_style_line=natural_oral_style_line,
         stage_block=stage_block,
@@ -786,6 +911,7 @@ def build_prompt(
     is_obtain_name: bool = False,
     is_active_ask: bool = False,
     active_ask_stage_hint: str = "",
+    active_ask_progress: Optional[dict] = None,
     robot_location_tags: Optional[List[str]] = None,
     active_tags: Optional[List[str]] = None,
     greeting_location_tag: str = GREETING_LOCATION_TAG,
@@ -810,7 +936,38 @@ def build_prompt(
 
     if is_active_ask:
         logger.info("构建主动招呼专用 prompt stage_hint=%s", active_ask_stage_hint or "(无)")
-        return _build_active_ask_prompt(query, context, stage_hint=active_ask_stage_hint)
+        progress = active_ask_progress if isinstance(active_ask_progress, dict) else {}
+        person_name = (
+            str(vision_user_name).strip()
+            if vision_user_name and str(vision_user_name).strip()
+            else str(progress.get("person_name") or "").strip()
+        )
+        has_vision_id = bool(
+            vision_user_id and str(vision_user_id).strip()
+        )
+        is_new_visitor = bool(progress.get("is_new_visitor", True)) if progress else True
+        identity_block = _build_active_ask_identity_lines(
+            person_name=person_name or None,
+            has_vision_id=has_vision_id,
+            is_new_visitor=is_new_visitor,
+        )
+        progress_block = _build_active_ask_progress_lines(
+            progress=progress,
+            has_vision_id=has_vision_id,
+        )
+        location_block = _build_robot_location_lines(
+            robot_location_tags,
+            greeting_location_tag=greeting_location_tag,
+            greeting_location_label=greeting_location_label,
+        )
+        return _build_active_ask_prompt(
+            query,
+            context,
+            stage_hint=active_ask_stage_hint,
+            identity_block=identity_block,
+            progress_block=progress_block,
+            location_block=location_block,
+        )
 
     # 首次见面需询问姓名时，使用专用 prompt，避免与 RAG 作答指令及默认 INTENT 规则冲突。
     if should_ask_name:

@@ -42,52 +42,64 @@ from .visitor_state import VisitorStateStore
 
 # ── 主动招呼阶段感知配置 ──────────────────────────────────────────────────────
 # step_id -> (检索用 tag, 检索语义词, 情境提示传给 LLM)
-# tag 与 data/ 下对应子目录名严格一致（DP 建库时按目录名打 tag）
+# tag 与 assets/index_store/metadata/ 下对应子目录名严格一致
+#
+# 阶段顺序与 visitor_state.DEFAULT_TOUR_STEPS 保持一致：
+#   greeting → interest_probe → needs_analysis → vehicle_selection
+#   → product_presentation → test_drive → quote_negotiation
+#   → deal_confirmation → contact_retention
 STAGE_ACTIVE_ASK_CONFIG: dict = {
     "greeting": (
         "active_ask_greeting",
         "展厅接待 进店问候 欢迎顾客 首次来访 建立信任",
         "顾客刚进入展厅或短暂停留，请先自然问候、建立信任，再轻量判断是否首次来访",
     ),
+    "interest_probe": (
+        "active_ask_interest_probe",
+        "意向摸底 来访目的 购车计划 感兴趣车型 随便看看 有意向",
+        "已完成基本问候，请轻松探问顾客本次到店的大致目的和兴趣方向，不要深挖细节，"
+        "以便判断后续是做产品讲解还是直接进入需求分析",
+    ),
     "needs_analysis": (
         "active_ask_needs_analysis",
         "需求分析 用车场景 预算 决策人 换车原因 关注点",
-        "已完成接待问候，请结合历史对话补齐需求信息，优先询问当前最缺的用车场景、预算、决策人或关注点",
+        "顾客已表达购车意向，请补齐需求核心信息，优先询问当前最缺的：用车场景、"
+        "预算区间、决策人构成或换车原因，一次只问一个",
     ),
     "vehicle_selection": (
         "active_ask_vehicle_selection",
         "车型推荐 版本推荐 配置推荐 纯电增程 家用通勤 长途",
-        "需求已有基础信息，请主动把需求转成车型、版本或配置方向建议，不要直接进入报价",
+        "需求已有基础，请主动将需求转化为车型、版本或配置方向建议，引导顾客聚焦，"
+        "不要直接跳入报价",
     ),
     "product_presentation": (
         "active_ask_product_presentation",
         "车辆展示 六方位绕车 外观 内饰 座舱 空间 安全 智能",
-        "车型方向已明确，请围绕顾客关心点做通用车辆展示，引导看外观、座舱、空间、安全或智能亮点",
+        "车型方向已明确，请围绕顾客已知关注点主动发起展示邀约，引导看外观、座舱、"
+        "空间或智能亮点，用问句带入而非单方面灌输",
     ),
     "test_drive": (
         "active_ask_testdrive",
         "试乘试驾 邀请试驾 路线说明 安全确认 驾驶反馈",
-        "车辆展示已完成，请主动邀请试乘试驾，或在试驾后承接顾客反馈",
+        "车辆讲解已完成，请主动邀请顾客试乘试驾；若已试驾，请自然承接驾驶感受的话题",
     ),
     "quote_negotiation": (
         "active_ask_quote_negotiation",
         "报价协商 价格 权益 金融 置换 补贴 预算异议",
-        "试驾或产品体验后，请主动进入价格、权益、金融或置换沟通，并先确认顾客预算与付款偏好",
+        "产品体验或试驾后，请主动进入价格沟通，先确认付款偏好（全款/分期/置换），"
+        "再做针对性报价或权益介绍",
     ),
     "deal_confirmation": (
         "active_ask_deal_confirmation",
         "成交确认 下订 配置 颜色 库存 合同 定金 异议处理",
-        "报价沟通后，请确认顾客购买意向、配置颜色和主要顾虑，必要时推进下订或保留方案",
+        "报价沟通已完成，请确认顾客购买意向、配置颜色偏好和主要顾虑，"
+        "必要时推进下订意向或提供保留方案",
     ),
-    "delivery_explanation": (
-        "active_ask_delivery_explanation",
-        "交车说明 交付周期 验车 上牌 功能讲解 售后对接",
-        "顾客已有下订或强购买意向，请说明交付流程、验车上牌、用车交接和售后对接",
-    ),
-    "after_sales_followup": (
-        "active_ask_after_sales_followup",
-        "售后跟进 回访 保养 质保 服务提醒 转介绍",
-        "交车说明已完成，请以服务关怀收尾，提醒后续回访、保养、用车支持或转介绍服务",
+    "contact_retention": (
+        "active_ask_contact_retention",
+        "留联系方式 预约回访 预约到店 加微信 邀请关注",
+        "对话接近尾声或顾客准备离店，请自然地邀请留下联系方式或预约下次到店，"
+        "作为本次接待的收尾动作；不要施压，以服务和关怀为出发点",
     ),
 }
 # ─────────────────────────────────────────────────────────────────────────────
@@ -675,7 +687,10 @@ class RAGService:
             user_state = self.visitor_state.get_or_create(vid)
 
         robot_location_tags: List[str] = []
-        if not is_obtain_name and not is_active_ask and not is_navigation_turn:
+        if is_active_ask:
+            # 主动招呼只读取当前位置，不改写导航状态
+            robot_location_tags = list(self._robot_location_tags)
+        elif not is_obtain_name and not is_navigation_turn:
             if self._pinned_navigation_tags:
                 vehicle_tags = self._filter_vehicle_location_tags(
                     self._pinned_navigation_tags
@@ -691,10 +706,15 @@ class RAGService:
             # 规则已确定姓名：LLM 仅需原样回显，保持「抽取调用返回姓名」的接口契约
             prompt = build_echo_name_prompt(rule_extracted_name)
         else:
+            active_ask_progress = None
+            if is_active_ask and vid:
+                active_ask_progress = self.visitor_state.get_active_ask_context(vid)
+                if resolved_name:
+                    active_ask_progress["person_name"] = resolved_name
             prompt = build_prompt(
                 raw_query,
                 context,
-                vision_user_id=vision_user_id,
+                vision_user_id=vid,
                 vision_user_name=resolved_name,
                 voice_user_id=voice_user_id,
                 visit_locations=visit_locations,
@@ -702,6 +722,7 @@ class RAGService:
                 is_obtain_name=is_obtain_name,
                 is_active_ask=is_active_ask,
                 active_ask_stage_hint=active_ask_stage_hint,
+                active_ask_progress=active_ask_progress,
                 robot_location_tags=robot_location_tags,
                 active_tags=resolved_tags,
                 greeting_location_tag=self.greeting_location_tag,

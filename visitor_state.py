@@ -9,52 +9,57 @@ from RAG.config.logger_runtime import get_logger
 
 logger = get_logger("rag")
 
-# 顾问式汽车销售流程（9 个核心阶段，按真实门店接待顺序排列）
+# 顾问式汽车展厅销售流程（9 个核心阶段，按真实接待顺序排列）
 # 每个 step 的 id 与 tour_lang_rules.py 中的规则 key 严格对应
+#
+# 设计原则：
+#   - 以展厅机器人实际能参与的环节为边界，不含交车/售后等离店流程
+#   - greeting（破冰）与 interest_probe（意向摸底）分离，避免初次接触就强推需求问题
+#   - contact_retention 作为收尾，聚焦"留联系方式/预约再访"，是展厅机器人最高价值动作
 DEFAULT_TOUR_STEPS: List[Dict[str, Any]] = [
     {
         "id": "greeting",
-        "title": "① 展厅接待：进店问候，建立信任",
+        "title": "① 展厅破冰：进店问候、建立信任、判断首次来访",
         "order": 1,
     },
     {
-        "id": "needs_analysis",
-        "title": "② 需求分析：用途、预算、决策人、换购原因",
+        "id": "interest_probe",
+        "title": "② 意向摸底：了解来意、粗粒度兴趣方向、购车成熟度",
         "order": 2,
     },
     {
-        "id": "vehicle_selection",
-        "title": "③ 车型推荐：匹配车型、版本和配置方向",
+        "id": "needs_analysis",
+        "title": "③ 深度需求：用途场景、预算区间、决策人、换购原因",
         "order": 3,
     },
     {
-        "id": "product_presentation",
-        "title": "④ 车辆展示：六方位讲解与核心卖点体验",
+        "id": "vehicle_selection",
+        "title": "④ 车型推荐：匹配车型、版本和配置方向",
         "order": 4,
     },
     {
-        "id": "test_drive",
-        "title": "⑤ 试乘试驾：路线说明、体验引导、反馈确认",
+        "id": "product_presentation",
+        "title": "⑤ 车辆展示：六方位讲解与核心卖点体验",
         "order": 5,
     },
     {
-        "id": "quote_negotiation",
-        "title": "⑥ 报价协商：价格、权益、金融、置换方案",
+        "id": "test_drive",
+        "title": "⑥ 试乘试驾：邀约试驾、路线说明、体验反馈",
         "order": 6,
     },
     {
-        "id": "deal_confirmation",
-        "title": "⑦ 成交确认：配置颜色、下订意向、异议处理",
+        "id": "quote_negotiation",
+        "title": "⑦ 报价协商：价格、权益、金融、置换方案",
         "order": 7,
     },
     {
-        "id": "delivery_explanation",
-        "title": "⑧ 交车说明：交付流程、用车事项、售后对接",
+        "id": "deal_confirmation",
+        "title": "⑧ 成交确认：配置颜色、下订意向、异议处理",
         "order": 8,
     },
     {
-        "id": "after_sales_followup",
-        "title": "⑨ 售后跟进：回访提醒、服务关怀、转介绍",
+        "id": "contact_retention",
+        "title": "⑨ 留档跟进：留联系方式、预约回访、邀请关注",
         "order": 9,
     },
 ]
@@ -399,13 +404,52 @@ class VisitorStateStore:
         return updated
 
     def get_next_pending_step(self, vision_id: str) -> Optional[Dict[str, Any]]:
-        """返回下一个尚未完成的阶段（只读，不标记），供主动招呼时决定话题。"""
+        """返回下一个待推进的阶段（只读，不标记），供主动招呼时决定话题。
+
+        策略：以"已完成的最高 order"为下限向后寻找，防止因规则乱序触发导致主动
+        对话倒退到早已经历过的阶段。若后续全部完成，则返回 None；若没有任何已完成
+        阶段（全新访客），则从头开始。
+        """
         state = self.get_or_create(vision_id)
         steps = sorted(state["tour_process"]["steps"], key=lambda s: s.get("order", 0))
+
+        # 找到已完成阶段的最高 order（0 表示尚无任何已完成阶段）
+        max_done_order = max(
+            (s.get("order", 0) for s in steps if s.get("asked")),
+            default=0,
+        )
+
+        # 优先：从最高已完成 order 之后找第一个未完成阶段
+        for step in steps:
+            if not step.get("asked") and step.get("order", 0) > max_done_order:
+                return step
+
+        # 兜底：若跳跃式触发导致前序有遗漏，返回最早的未完成阶段（保持对话完整性）
         for step in steps:
             if not step.get("asked"):
                 return step
+
         return None
+
+    def get_active_ask_context(self, vision_id: str) -> Dict[str, Any]:
+        """供主动招呼 prompt 使用的结构化进展（只读，不推进阶段）。"""
+        state = self.get_or_create(vision_id)
+        next_step = self.get_next_pending_step(vision_id)
+        steps = sorted(state["tour_process"]["steps"], key=lambda s: s.get("order", 0))
+        done = [str(step.get("title") or step["id"]) for step in steps if step.get("asked")]
+        pending = [str(step.get("title") or step["id"]) for step in steps if not step.get("asked")]
+        person_name = str(state.get("person_name") or "").strip()
+        return {
+            "person_name": person_name,
+            "done_titles": done,
+            "pending_titles": pending,
+            "current_step_id": str(next_step["id"]) if next_step else "",
+            "current_step_title": (
+                str(next_step.get("title") or next_step["id"]) if next_step else ""
+            ),
+            "interest_summary": self.get_interest_summary(vision_id),
+            "is_new_visitor": len(done) == 0,
+        }
 
     def mark_next_tour_step(self, vision_id: str) -> Optional[str]:
         """按顺序标记下一个尚未询问的观车环节，返回 step_id。"""
