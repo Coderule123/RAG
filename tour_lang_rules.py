@@ -9,7 +9,9 @@
 规则设计原则
 ------------
 1. 每个规则包含 any_of（满足任意一条即命中）和 all_of（需同时满足全部才命中，可为空）。
-2. 对话文本取 query（用户输入）+ response（机器人回复）的合并串进行匹配。
+2. 阶段完成只认顾客原话（query）。机器人回复不得用来标记完成，
+   否则导购自己介绍价格/外观会被记成「报价协商/车辆展示已完成」，
+   后续主动询问会错误跳到成交确认。
 3. 优先高精度，宁可漏报也不误报：
    - 避免使用单个高频通用词（如"外观""续航""价格"单独出现）
    - 多用复合短语，确保语境清晰后再触发
@@ -17,6 +19,8 @@
 5. 阶段顺序：greeting → interest_probe → needs_analysis → vehicle_selection
              → product_presentation → test_drive → quote_negotiation
              → deal_confirmation → contact_retention
+6. 「问得多 / 问过价格」只表示更关心，不等于成交确认；
+   成交/留档必须由顾客亲口触及下订、定金、合同、留资等规则才标记。
 """
 
 import re
@@ -270,16 +274,16 @@ def detect_completed_steps(
     extra_context: str = "",
 ) -> List[str]:
     """
-    对本轮对话文本（query + response + extra_context）运行全部规则，
-    返回命中的 step_id 列表（保持规则定义顺序，去重）。
+    对顾客原话运行全部规则，返回命中的 step_id 列表（保持规则定义顺序，去重）。
 
     参数
     ----
-    query        : 用户输入文本
-    response     : 机器人回复文本（可为空，仅用 query 也能匹配）
-    extra_context: 附加文本（如 RAG 上下文片段关键词），通常留空
+    query        : 用户输入文本（唯一用于匹配的文本）
+    response     : 兼容旧调用，忽略。不得用机器人回复标记阶段完成
+    extra_context: 兼容旧调用，忽略
     """
-    text = " ".join(filter(None, [query, response, extra_context]))
+    del response, extra_context
+    text = query or ""
     matched: List[str] = []
     seen: Set[str] = set()
 

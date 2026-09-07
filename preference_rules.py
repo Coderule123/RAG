@@ -230,7 +230,7 @@ def detect_preferences(
     fallback_vehicles: Optional[Sequence[str]] = None,
 ) -> Dict[str, List[str]]:
     """
-    识别本轮对话中的车型与关注点。
+    识别本轮【顾客原话】中的车型与关注点。
 
     返回:
         {
@@ -238,11 +238,13 @@ def detect_preferences(
           "topics": ["price", "chassis", ...],
         }
 
+    车型与关注点都只认 query。response 仅保留兼容旧调用，避免把导购自己
+    提到的车型/卖点记成顾客兴趣（否则 ask_count 会被机器人话术抬高）。
     若命中关注点但未命中车型，则回退使用 fallback_vehicles（如上一轮关注车型）。
     """
-    text = " ".join(filter(None, [query, response]))
-    vehicles = detect_vehicles(text, vehicle_tags=vehicle_tags)
-    topics = detect_topics(query)  # 关注点以用户问题为主，避免被导购话术带偏
+    del response  # 明确不采用机器人回复
+    vehicles = detect_vehicles(query, vehicle_tags=vehicle_tags)
+    topics = detect_topics(query)
     if not vehicles and topics:
         fallback = [
             _normalize_vehicle_tag(v) or str(v).strip().lower()

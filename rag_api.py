@@ -92,8 +92,8 @@ STAGE_ACTIVE_ASK_CONFIG: dict = {
     "deal_confirmation": (
         "active_ask_deal_confirmation",
         "成交确认 下订 配置 颜色 库存 合同 定金 异议处理",
-        "报价沟通已完成，请确认顾客购买意向、配置颜色偏好和主要顾虑，"
-        "必要时推进下订意向或提供保留方案",
+        "仅在前面讲解/试驾/报价环节都已由顾客亲口走过后，才确认购买意向、配置颜色。"
+        "顾客问得多只表示更关心，不是成交信号；禁止一上来就锁单或留资",
     ),
     "contact_retention": (
         "active_ask_contact_retention",
@@ -683,7 +683,7 @@ class RAGService:
                         self._pending_name_user_id = vid
 
         if vid and is_active_ask and not is_obtain_name:
-            # 主动询问不直接推进阶段；阶段完成仍由用户问题 + LLM 回复的语言规则后处理决定。
+            # 主动询问不推进阶段；阶段/喜好只在顾客原话上标记。
             user_state = self.visitor_state.get_or_create(vid)
 
         robot_location_tags: List[str] = []
@@ -735,8 +735,8 @@ class RAGService:
 
         # ── 语言规则库：根据本轮 query 自动标记已完成的观车环节 ──────────────
         auto_steps: List[str] = []
-        if vid and not is_obtain_name:
-            auto_steps = detect_completed_steps(query=raw_query, response="")
+        if vid and not is_obtain_name and not is_active_ask:
+            auto_steps = detect_completed_steps(query=raw_query)
             if auto_steps:
                 for step_id in auto_steps:
                     self.visitor_state.mark_tour_step_asked(vid, step_id)

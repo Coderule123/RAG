@@ -66,6 +66,33 @@ DEFAULT_TOUR_STEPS: List[Dict[str, Any]] = [
 
 _UNSAFE_FILENAME_PATTERN = re.compile(r"[^\w\-.]")
 
+# 中控主动询问的系统指令，不是顾客原话，不得用来标记阶段/喜好
+_ACTIVE_ASK_QUERY_PREFIX = "请求主动询问"
+
+# 破冰阶段：顾客一旦开口或已有车型关注，主动询问不再回到这两步
+_ICEBREAKER_STEP_IDS = frozenset({"greeting", "interest_probe"})
+# 收尾阶段：不能因为问过价格/问得多就跳进来；须前面中间环节都走完
+_LATE_FUNNEL_STEP_IDS = frozenset({"deal_confirmation", "contact_retention"})
+
+
+def _is_system_active_ask_query(query: str) -> bool:
+    return (query or "").strip().startswith(_ACTIVE_ASK_QUERY_PREFIX)
+
+
+def _care_label(ask_count: int) -> str:
+    """把提问次数转成关心程度，避免模型把数字理解成成交进度。"""
+    try:
+        count = int(ask_count)
+    except (TypeError, ValueError):
+        count = 0
+    if count >= 5:
+        return "很关心"
+    if count >= 2:
+        return "较关心"
+    if count >= 1:
+        return "有关注"
+    return ""
+
 
 def _safe_state_filename(vision_id: str) -> str:
     """将 vision_user_id 转为安全的单用户状态文件名。"""
@@ -406,28 +433,40 @@ class VisitorStateStore:
     def get_next_pending_step(self, vision_id: str) -> Optional[Dict[str, Any]]:
         """返回下一个待推进的阶段（只读，不标记），供主动招呼时决定话题。
 
-        策略：以"已完成的最高 order"为下限向后寻找，防止因规则乱序触发导致主动
-        对话倒退到早已经历过的阶段。若后续全部完成，则返回 None；若没有任何已完成
-        阶段（全新访客），则从头开始。
+        策略：按顺序补齐第一个未完成的中间环节，而不是用「已完成的最高 order」
+        往后跳。否则顾客只问了一次价格，quote_negotiation 被标记后，主动询问
+        会直接落到成交确认。问得多只表示更关心，不是该锁单。
+
+        - 已有后续交流或车型关注时，跳过 greeting / interest_probe，避免再走迎宾。
+        - deal_confirmation / contact_retention 仅当前面中间环节都完成后才进入。
         """
         state = self.get_or_create(vision_id)
         steps = sorted(state["tour_process"]["steps"], key=lambda s: s.get("order", 0))
+        asked_ids = {str(s.get("id")) for s in steps if s.get("asked")}
+        profile = state.get("interest_profile") or {}
+        vehicles = profile.get("vehicles") if isinstance(profile, dict) else {}
+        has_vehicle_interest = bool(isinstance(vehicles, dict) and vehicles)
+        already_engaged = bool(asked_ids) or has_vehicle_interest
+        later_than_icebreaker = bool(asked_ids - _ICEBREAKER_STEP_IDS)
 
-        # 找到已完成阶段的最高 order（0 表示尚无任何已完成阶段）
-        max_done_order = max(
-            (s.get("order", 0) for s in steps if s.get("asked")),
-            default=0,
-        )
-
-        # 优先：从最高已完成 order 之后找第一个未完成阶段
         for step in steps:
-            if not step.get("asked") and step.get("order", 0) > max_done_order:
-                return step
-
-        # 兜底：若跳跃式触发导致前序有遗漏，返回最早的未完成阶段（保持对话完整性）
-        for step in steps:
-            if not step.get("asked"):
-                return step
+            if step.get("asked"):
+                continue
+            sid = str(step.get("id") or "")
+            if sid == "greeting" and already_engaged:
+                continue
+            if sid == "interest_probe" and (has_vehicle_interest or later_than_icebreaker):
+                continue
+            if sid in _LATE_FUNNEL_STEP_IDS:
+                earlier_pending = any(
+                    (not s.get("asked"))
+                    and str(s.get("id") or "") not in _LATE_FUNNEL_STEP_IDS
+                    for s in steps
+                    if int(s.get("order") or 0) < int(step.get("order") or 0)
+                )
+                if earlier_pending:
+                    continue
+            return step
 
         return None
 
@@ -490,29 +529,33 @@ class VisitorStateStore:
         vehicle_tags: Optional[List[str]] = None,
     ) -> List[str]:
         """
-        对 query + response 运行语言规则库，批量标记命中的观车环节，
+        只对顾客原话运行语言规则库，批量标记命中的观车环节，
         并同步更新用户喜好感知（询问过的车型与关注点）。
         返回本次新标记的 step_id 列表（已标记过的不重复计入）。
 
-        典型用法：LLM 返回回复后调用一次，传入 (query, llm_response)。
+        response 保留兼容旧调用，但不再参与匹配。
+        系统主动询问指令（「请求主动询问…」）直接跳过。
         """
         from RAG.tour_lang_rules import detect_completed_steps, steps_summary
 
-        matched = detect_completed_steps(query=query, response=response)
+        del response
+        if _is_system_active_ask_query(query):
+            return []
+
+        matched = detect_completed_steps(query=query)
         newly_marked: List[str] = []
         for step_id in matched:
             if self.mark_tour_step_asked(vision_id, step_id):
                 newly_marked.append(step_id)
         if newly_marked:
             logger.info(
-                "语言规则标记(含回复): vision_user_id=%s 新增=[%s]",
+                "语言规则标记(仅顾客原话): vision_user_id=%s 新增=[%s]",
                 vision_id,
                 steps_summary(newly_marked),
             )
         self.record_preferences_from_texts(
             vision_id,
             query=query,
-            response=response,
             vehicle_tags=vehicle_tags,
         )
         return newly_marked
@@ -532,7 +575,8 @@ class VisitorStateStore:
         fallback_vehicles: Optional[List[str]] = None,
     ) -> Dict[str, List[str]]:
         """
-        根据本轮对话更新喜好感知：记录询问过的车型，以及每个车型下的关注点。
+        根据顾客原话更新喜好感知：记录询问过的车型，以及每个车型下的关注点。
+        机器人回复不计入 ask_count。
         返回本轮识别结果 {"vehicles": [...], "topics": [...]}。
         """
         from RAG.preference_rules import (
@@ -551,9 +595,13 @@ class VisitorStateStore:
         if last_tag and last_tag not in fallback:
             fallback.append(str(last_tag))
 
+        del response
+        if _is_system_active_ask_query(query):
+            return {"vehicles": [], "topics": []}
+
         detected = detect_preferences(
             query=query,
-            response=response,
+            response="",
             vehicle_tags=vehicle_tags,
             fallback_vehicles=fallback,
         )
@@ -609,7 +657,11 @@ class VisitorStateStore:
         return detected
 
     def get_interest_summary(self, vision_id: str) -> str:
-        """生成可读的喜好摘要，供日志/prompt 使用。"""
+        """生成可读的喜好摘要，供日志/prompt 使用。
+
+        提问次数只转成「有关注/较关心/很关心」，不把数字写进 prompt，
+        避免模型把问得多理解成该成交确认。
+        """
         state = self.get_or_create(vision_id)
         profile = state.get("interest_profile") or {}
         vehicles = profile.get("vehicles") if isinstance(profile, dict) else {}
@@ -620,14 +672,20 @@ class VisitorStateStore:
         for tag, info in vehicles.items():
             if not isinstance(info, dict):
                 continue
+            care = _care_label(info.get("ask_count") or 0)
             topics = info.get("topics") if isinstance(info.get("topics"), dict) else {}
             titles = [
                 str(t.get("title") or tid)
                 for tid, t in topics.items()
                 if isinstance(t, dict)
             ]
-            if titles:
-                parts.append(f"{tag}({ '、'.join(titles) })")
+            detail = "、".join(titles) if titles else ""
+            if care and detail:
+                parts.append(f"{tag}（{care}：{detail}）")
+            elif care:
+                parts.append(f"{tag}（{care}）")
+            elif detail:
+                parts.append(f"{tag}（{detail}）")
             else:
                 parts.append(str(tag))
         return "喜好感知：已关注 " + "；".join(parts)
