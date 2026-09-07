@@ -79,6 +79,11 @@ def _is_system_active_ask_query(query: str) -> bool:
     return (query or "").strip().startswith(_ACTIVE_ASK_QUERY_PREFIX)
 
 
+def is_system_active_ask_query(query: str) -> bool:
+    """中控主动询问指令，不是顾客原话。"""
+    return _is_system_active_ask_query(query)
+
+
 def _care_label(ask_count: int) -> str:
     """把提问次数转成关心程度，避免模型把数字理解成成交进度。"""
     try:
@@ -689,6 +694,58 @@ class VisitorStateStore:
             else:
                 parts.append(str(tag))
         return "喜好感知：已关注 " + "；".join(parts)
+
+    def get_interest_retrieval_hints(self, vision_id: str) -> Dict[str, Any]:
+        """供主动询问拼向量检索词：车型、已问过的关注点（按关心程度排序）。"""
+        state = self.get_or_create(vision_id)
+        profile = state.get("interest_profile") if isinstance(state, dict) else {}
+        vehicles_map = profile.get("vehicles") if isinstance(profile, dict) else {}
+        if not isinstance(vehicles_map, dict):
+            vehicles_map = {}
+
+        ranked_vehicles: List[tuple] = []
+        topic_counts: Dict[str, int] = {}
+        for tag, info in vehicles_map.items():
+            if not isinstance(tag, str) or not tag.strip() or not isinstance(info, dict):
+                continue
+            try:
+                ask_count = int(info.get("ask_count") or 0)
+            except (TypeError, ValueError):
+                ask_count = 0
+            ranked_vehicles.append((ask_count, tag.strip().lower()))
+            topics = info.get("topics") if isinstance(info.get("topics"), dict) else {}
+            for tid, tinfo in topics.items():
+                if not isinstance(tinfo, dict):
+                    continue
+                title = str(tinfo.get("title") or tid).strip()
+                if not title:
+                    continue
+                try:
+                    count = int(tinfo.get("count") or 0)
+                except (TypeError, ValueError):
+                    count = 0
+                topic_counts[title] = topic_counts.get(title, 0) + max(count, 1)
+
+        ranked_vehicles.sort(key=lambda item: item[0], reverse=True)
+        vehicle_tags = [tag for _, tag in ranked_vehicles]
+        topic_titles = [
+            title
+            for title, _ in sorted(
+                topic_counts.items(), key=lambda item: item[1], reverse=True
+            )
+        ]
+        last_tag = profile.get("last_vehicle_tag") if isinstance(profile, dict) else None
+        last_vehicle_tag = (
+            str(last_tag).strip().lower()
+            if isinstance(last_tag, str) and last_tag.strip()
+            else (vehicle_tags[0] if vehicle_tags else "")
+        )
+        return {
+            "vehicle_tags": vehicle_tags,
+            "topic_titles": topic_titles,
+            "has_interest": bool(vehicle_tags or topic_titles),
+            "last_vehicle_tag": last_vehicle_tag,
+        }
 
     def get_state_file_path(self, vision_id: str) -> str:
         return str(self._state_path(vision_id))

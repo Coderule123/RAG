@@ -24,11 +24,11 @@ from RAG.DP.embedding_service import EmbeddingService
 
 from .context_builder import build_context
 from .prompt_builder import (
-    ACTIVE_ASK_TAG,
     DEFAULT_ACTIVE_ASK_RETRIEVAL_QUERY,
     DEFAULT_GREETING_LOCATION_LABEL,
     GREETING_LOCATION_TAG,
     MOVE_TO_WAIT_INTENT_PREFIX,
+    VEHICLE_TAG_DISPLAY_NAMES,
     build_echo_name_prompt,
     build_prompt,
     extract_name_by_rules,
@@ -103,6 +103,100 @@ STAGE_ACTIVE_ASK_CONFIG: dict = {
     ),
 }
 # ─────────────────────────────────────────────────────────────────────────────
+
+_NEARBY_POSE_PATTERN = re.compile(
+    r"(?:^|\s)nearby_pose=([A-Za-z0-9_\-]+)",
+    re.IGNORECASE,
+)
+_TOPIC_RETRIEVAL_HINTS: Dict[str, str] = {
+    "价格": "价格 报价 预算 落地价",
+    "颜色": "颜色 外观配色 车漆",
+    "空间": "空间 后排 家人乘坐 腿部空间",
+    "操控": "操控 驾驶感受 开起来 动力",
+    "内饰": "内饰 座舱 座椅 屏幕",
+    "外饰": "外观 外饰 车身 灯组",
+    "智驾": "智驾 辅助驾驶 激光雷达",
+    "续航": "续航 补能 充电",
+    "底盘": "底盘 悬架 转向",
+    "舒适": "舒适 隔音 座椅",
+    "配置": "配置 版本 选装",
+    "安全": "安全 气囊",
+    "试驾": "试驾 试乘 开一开",
+    "交付": "交付 现车 库存",
+}
+
+
+def _parse_nearby_pose(query: str) -> Optional[str]:
+    """从中控主动询问指令里取出 nearby_pose，忽略 active_ask* 等非展车 tag。"""
+    match = _NEARBY_POSE_PATTERN.search(query or "")
+    if not match:
+        return None
+    tag = match.group(1).strip().lower()
+    if not tag or tag == "general" or tag.startswith("active_ask"):
+        return None
+    return tag
+
+
+def _vehicle_display_name(tag: str) -> str:
+    normalized = (tag or "").strip().lower()
+    return VEHICLE_TAG_DISPLAY_NAMES.get(normalized, normalized.upper() if normalized else "")
+
+
+def build_active_ask_retrieve_query(
+    stage_query_tmpl: str,
+    step_id: str = "",
+    interest_hints: Optional[Dict[str, Any]] = None,
+    nearby_pose: Optional[str] = None,
+) -> str:
+    """
+    用访客进展拼主动询问的向量检索词。
+
+    中控只发「请求主动询问顾客问题」，不能拿这句话去 FAISS。
+    检索词由：当前阶段模板 + 最近点位 + 顾客亲口关注的车型/配置 组成。
+    """
+    parts: List[str] = [str(stage_query_tmpl or "").strip()]
+    hints = interest_hints if isinstance(interest_hints, dict) else {}
+    pose = (nearby_pose or "").strip().lower()
+    if pose:
+        display = _vehicle_display_name(pose)
+        parts.append(f"当前在{display}展车旁 开口话术")
+
+    vehicle_tags = [
+        str(tag).strip().lower()
+        for tag in (hints.get("vehicle_tags") or [])
+        if str(tag).strip()
+    ]
+    topic_titles = [
+        str(title).strip()
+        for title in (hints.get("topic_titles") or [])
+        if str(title).strip()
+    ]
+    if vehicle_tags:
+        names = [_vehicle_display_name(tag) for tag in vehicle_tags[:3]]
+        parts.append("顾客关注 " + " ".join(names))
+    if topic_titles:
+        parts.append("已问过 " + " ".join(topic_titles[:4]))
+        extra = [_TOPIC_RETRIEVAL_HINTS.get(title, title) for title in topic_titles[:4]]
+        parts.append(" ".join(extra))
+        parts.append("围绕已问过的点继续 不要编造没问过的卖点")
+    else:
+        parts.append("尚无明确关注点 不要点名具体卖点 轻轻探问来意或下一环节")
+
+    step_extras = {
+        "greeting": "初次进店 轻量问候 不要长篇介绍",
+        "interest_probe": "探问来意 轿车还是SUV 随便看看还是有意向",
+        "needs_analysis": "一次只问一个 用途场景 家人 预算",
+        "vehicle_selection": "匹配车型版本 不要跳入报价",
+        "product_presentation": "用问句带入展示 外观座舱空间",
+        "test_drive": "邀请试驾 联系用户主理人安排",
+        "quote_negotiation": "价格权益 付款方式 不是成交锁单",
+        "deal_confirmation": "确认意向和顾虑 不施压锁单",
+        "contact_retention": "下次再来 不施压留资",
+    }
+    extra = step_extras.get(str(step_id or "").strip())
+    if extra:
+        parts.append(extra)
+    return " ".join(part for part in parts if part).strip()
 
 CURRENT_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = CURRENT_DIR.parent
@@ -460,7 +554,6 @@ class RAGService:
             else int(retrieval_cfg.get("rerank_top_n", 4))
         )
 
-        active_ask_tag = retrieval_cfg.get("active_ask_tag", ACTIVE_ASK_TAG)
         default_active_ask_query = retrieval_cfg.get(
             "active_ask_retrieval_query", DEFAULT_ACTIVE_ASK_RETRIEVAL_QUERY
         )
@@ -468,32 +561,53 @@ class RAGService:
         # ── tag 解析 ─────────────────────────────────────────────────────────
         active_ask_stage_hint: str = ""
         is_navigation_turn = False
+        nearby_pose_tag: Optional[str] = None
         if is_active_ask:
-            # 阶段感知：若有用户 ID，根据当前导购阶段选择专属 tag 与检索词
-            stage_tag = str(active_ask_tag).lower()
-            stage_query = raw_query or default_active_ask_query
+            # 中控只发「请求主动询问顾客问题 nearby_pose=…」，不能拿它做向量检索。
+            # 阶段、关注点、最近点位都由 RAG 按 uuid / 指令后缀自己拼检索词。
+            nearby_pose_tag = _parse_nearby_pose(raw_query)
+            interest_hints: Dict[str, Any] = {}
+            next_step = None
             if vid:
                 next_step = self.visitor_state.get_next_pending_step(vid)
-                if next_step:
-                    step_id = next_step["id"]
-                    cfg = STAGE_ACTIVE_ASK_CONFIG.get(step_id)
-                    if cfg:
-                        stage_tag, stage_query_tmpl, active_ask_stage_hint = cfg
-                        stage_query = raw_query or stage_query_tmpl
-                        logger.info(
-                            "主动招呼阶段感知: step_id=%s tag=%s hint=%s",
-                            step_id, stage_tag, active_ask_stage_hint,
-                        )
-                    else:
-                        logger.info("主动招呼阶段感知: step_id=%s 无对应配置，使用通用 tag", step_id)
-                else:
-                    logger.info("主动招呼：用户 %s 全部阶段已完成，使用通用兜底", vid)
-            resolved_tags = [stage_tag]
-            retrieve_query = stage_query
+                interest_hints = self.visitor_state.get_interest_retrieval_hints(vid)
+
+            if next_step and next_step.get("id") in STAGE_ACTIVE_ASK_CONFIG:
+                step_id = str(next_step["id"])
+            elif vid and next_step is None:
+                step_id = "contact_retention"
+                logger.info("主动招呼：用户 %s 中间环节已走完，收尾用留档跟进", vid)
+            else:
+                step_id = "greeting"
+
+            cfg = STAGE_ACTIVE_ASK_CONFIG.get(step_id)
+            if cfg:
+                stage_tag, stage_query_tmpl, active_ask_stage_hint = cfg
+            else:
+                stage_tag = "active_ask_greeting"
+                stage_query_tmpl = DEFAULT_ACTIVE_ASK_RETRIEVAL_QUERY
+                active_ask_stage_hint = (
+                    "顾客短暂停留，请先自然问候，不要假装记得对方没说过的事"
+                )
+                logger.info("主动招呼阶段感知: step_id=%s 无对应配置，回退问候", step_id)
+
+            retrieve_query = build_active_ask_retrieve_query(
+                stage_query_tmpl,
+                step_id=step_id,
+                interest_hints=interest_hints,
+                nearby_pose=nearby_pose_tag,
+            )
+            if not retrieve_query:
+                retrieve_query = default_active_ask_query or DEFAULT_ACTIVE_ASK_RETRIEVAL_QUERY
+            resolved_tags = [str(stage_tag).lower()]
             logger.info(
-                "主动招呼模式: tag=%s retrieve_query=%s",
+                "主动招呼阶段感知: step_id=%s tag=%s nearby_pose=%s interest=%s retrieve_query=%s hint=%s",
+                step_id,
                 resolved_tags,
+                nearby_pose_tag or "(无)",
+                interest_hints,
                 retrieve_query,
+                active_ask_stage_hint,
             )
         else:
             retrieve_query = raw_query
@@ -640,7 +754,7 @@ class RAGService:
             # 重排（根据配置决定是否执行）
             if self.use_reranker and self.reranker is not None:
                 t1 = time.perf_counter()
-                reranked = self.reranker.rerank(query, retrieved, rerank_top_n)
+                reranked = self.reranker.rerank(retrieve_query, retrieved, rerank_top_n)
                 timings["rerank"] = time.perf_counter() - t1
             else:
                 # 未启用重排时，直接使用检索结果，并截取前 rerank_top_n 条
@@ -688,8 +802,10 @@ class RAGService:
 
         robot_location_tags: List[str] = []
         if is_active_ask:
-            # 主动招呼只读取当前位置，不改写导航状态
-            robot_location_tags = list(self._robot_location_tags)
+            # 主动招呼不改写导航状态；本轮优先用中控 nearby_pose
+            robot_location_tags = (
+                [nearby_pose_tag] if nearby_pose_tag else list(self._robot_location_tags)
+            )
         elif not is_obtain_name and not is_navigation_turn:
             if self._pinned_navigation_tags:
                 vehicle_tags = self._filter_vehicle_location_tags(

@@ -7,11 +7,11 @@ from RAG.config.logger_runtime import get_logger
 
 logger = get_logger("rag")
 
-# 主动招呼模式：仅检索 data/active_ask/ 下文档（metadata.tag=active_ask）
+# 主动招呼模式：按导购阶段检索 active_ask_* ；此默认句仅作无阶段信息时的兜底检索词
 ACTIVE_ASK_TAG = "active_ask"
-# 无用户发言时用于向量检索的默认语义查询
+# 无用户发言、也还没读到访客进展时，用于向量检索的默认语义查询
 DEFAULT_ACTIVE_ASK_RETRIEVAL_QUERY = (
-    "展厅主动招呼 欢迎语 引导顾客交流 开口话术 接待用语"
+    "展厅主动招呼 欢迎语 引导顾客交流 开口话术 接待用语 轻轻探问来意"
 )
 
 # vision_user_id 为时间戳时的格式：年_月_日_分_秒
@@ -742,6 +742,9 @@ def _build_active_ask_prompt(
     问得多不是成交。
     """
     hint = (query or "").strip()
+    if hint.startswith("请求主动询问"):
+        # 中控指令不是顾客问题；位置已由 location_block 提供，这里不再当作情境提示
+        hint = ""
     hint_block = ""
     if hint:
         hint_block = (
