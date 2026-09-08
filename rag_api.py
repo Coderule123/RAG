@@ -37,6 +37,11 @@ from .prompt_builder import (
 )
 from .reranker_service import RerankerService
 from .retriever_runtime import RetrieverRuntime
+from .customer_memory import (
+    answered_ask_texts,
+    should_drop_retrieved_script,
+    utterances_as_retrieval_hints,
+)
 from .tour_lang_rules import detect_completed_steps, steps_summary
 from .visitor_state import VisitorStateStore
 
@@ -62,13 +67,13 @@ STAGE_ACTIVE_ASK_CONFIG: dict = {
     ),
     "needs_analysis": (
         "active_ask_needs_analysis",
-        "需求分析 用车场景 预算 决策人 换车原因 关注点",
+        "需求分析 用车场景 预算 决策人 换车原因 关注点 一次只问尚未确认的点",
         "顾客已表达购车意向，请补齐需求核心信息，优先询问当前最缺的：用车场景、"
         "预算区间、决策人构成或换车原因，一次只问一个",
     ),
     "vehicle_selection": (
         "active_ask_vehicle_selection",
-        "车型推荐 版本推荐 配置推荐 纯电增程 家用通勤 长途",
+        "车型推荐 版本推荐 配置推荐 纯电增程 轿车SUV",
         "需求已有基础，请主动将需求转化为车型、版本或配置方向建议，引导顾客聚焦，"
         "不要直接跳入报价",
     ),
@@ -147,12 +152,14 @@ def build_active_ask_retrieve_query(
     step_id: str = "",
     interest_hints: Optional[Dict[str, Any]] = None,
     nearby_pose: Optional[str] = None,
+    customer_utterances: Optional[List[str]] = None,
 ) -> str:
     """
     用访客进展拼主动询问的向量检索词。
 
     中控只发「请求主动询问顾客问题」，不能拿这句话去 FAISS。
-    检索词由：当前阶段模板 + 最近点位 + 顾客亲口关注的车型/配置 组成。
+    检索词 = 当前阶段模板 + 最近点位 + 车型关注点 + 顾客原话（原样拼接）。
+    顾客原话不做槽位抽取，任意主题都能把检索从「再问一遍」拉到「往下问」。
     """
     parts: List[str] = [str(stage_query_tmpl or "").strip()]
     hints = interest_hints if isinstance(interest_hints, dict) else {}
@@ -171,6 +178,10 @@ def build_active_ask_retrieve_query(
         for title in (hints.get("topic_titles") or [])
         if str(title).strip()
     ]
+    utterance_hint = utterances_as_retrieval_hints(customer_utterances or [])
+    if utterance_hint:
+        parts.append(utterance_hint)
+
     if vehicle_tags:
         names = [_vehicle_display_name(tag) for tag in vehicle_tags[:3]]
         parts.append("顾客关注 " + " ".join(names))
@@ -179,14 +190,14 @@ def build_active_ask_retrieve_query(
         extra = [_TOPIC_RETRIEVAL_HINTS.get(title, title) for title in topic_titles[:4]]
         parts.append(" ".join(extra))
         parts.append("围绕已问过的点继续 不要编造没问过的卖点")
-    else:
+    elif not utterance_hint:
         parts.append("尚无明确关注点 不要点名具体卖点 轻轻探问来意或下一环节")
 
     step_extras = {
         "greeting": "初次进店 轻量问候 不要长篇介绍",
         "interest_probe": "探问来意 轿车还是SUV 随便看看还是有意向",
-        "needs_analysis": "一次只问一个 用途场景 家人 预算",
-        "vehicle_selection": "匹配车型版本 不要跳入报价",
+        "needs_analysis": "一次只问一个 用途场景 预算 不要重复已经说过的内容",
+        "vehicle_selection": "匹配车型版本 轿车SUV 不要跳入报价 不要重复已经说过的内容",
         "product_presentation": "用问句带入展示 外观座舱空间",
         "test_drive": "邀请试驾 联系用户主理人安排",
         "quote_negotiation": "价格权益 付款方式 不是成交锁单",
@@ -453,6 +464,13 @@ class RAGService:
         self.reset_robot_to_greeting_location()
         return True
 
+    def record_last_active_ask(self, vision_user_id: str, text: str) -> None:
+        """把本轮主动询问原文写入访客状态，供下一轮禁止换皮再问、检索过滤同义话术。"""
+        vid = (vision_user_id or "").strip()
+        if not vid or not (text or "").strip():
+            return
+        self.visitor_state.record_last_active_ask(vid, text)
+
     def _print_result(self, result: Dict[str, Any]) -> None:
         """打印 RAG 结果的详细信息（日志+控制台），与原有 print_rag_result 功能一致"""
         logger.info("检索耗时: %.4fs", result["timings"]["retrieve"])
@@ -562,6 +580,13 @@ class RAGService:
         active_ask_stage_hint: str = ""
         is_navigation_turn = False
         nearby_pose_tag: Optional[str] = None
+        # 本轮主动问用来过滤检索、拼检索词的档案（全是原句，不是封闭标签）
+        # active_ask_utterances: 顾客亲口说过的滚动原话
+        # active_ask_answered: 已经问过并得到回答的主动问原文
+        # active_ask_last_text: 上一句主动问原文，禁止换皮再问
+        active_ask_utterances: List[str] = []
+        active_ask_answered: List[str] = []
+        active_ask_last_text: str = ""
         if is_active_ask:
             # 中控只发「请求主动询问顾客问题 nearby_pose=…」，不能拿它做向量检索。
             # 阶段、关注点、最近点位都由 RAG 按 uuid / 指令后缀自己拼检索词。
@@ -571,6 +596,15 @@ class RAGService:
             if vid:
                 next_step = self.visitor_state.get_next_pending_step(vid)
                 interest_hints = self.visitor_state.get_interest_retrieval_hints(vid)
+                ctx = self.visitor_state.get_active_ask_context(vid)
+                active_ask_utterances = list(ctx.get("customer_utterances") or [])
+                # 已回答的问句 + 最近主动问原文，一并拿去滤换皮同问
+                active_ask_answered = answered_ask_texts(ctx.get("answered_asks") or [])
+                for ask_text in ctx.get("recent_ask_texts") or []:
+                    ask_text = str(ask_text or "").strip()
+                    if ask_text and ask_text not in active_ask_answered:
+                        active_ask_answered.append(ask_text)
+                active_ask_last_text = str(ctx.get("last_active_ask_text") or "")
 
             if next_step and next_step.get("id") in STAGE_ACTIVE_ASK_CONFIG:
                 step_id = str(next_step["id"])
@@ -596,16 +630,18 @@ class RAGService:
                 step_id=step_id,
                 interest_hints=interest_hints,
                 nearby_pose=nearby_pose_tag,
+                customer_utterances=active_ask_utterances,
             )
             if not retrieve_query:
                 retrieve_query = default_active_ask_query or DEFAULT_ACTIVE_ASK_RETRIEVAL_QUERY
             resolved_tags = [str(stage_tag).lower()]
             logger.info(
-                "主动招呼阶段感知: step_id=%s tag=%s nearby_pose=%s interest=%s retrieve_query=%s hint=%s",
+                "主动招呼阶段感知: step_id=%s tag=%s nearby_pose=%s interest=%s utterances=%s retrieve_query=%s hint=%s",
                 step_id,
                 resolved_tags,
                 nearby_pose_tag or "(无)",
                 interest_hints,
+                active_ask_utterances,
                 retrieve_query,
                 active_ask_stage_hint,
             )
@@ -761,6 +797,33 @@ class RAGService:
                 reranked = retrieved[:rerank_top_n]
                 timings["rerank"] = 0.0
 
+            # 有原话或上一句主动问时，丢掉换皮同问。全部丢掉就留空上下文，
+            # 不要回退到冲突话术——空资料比再问一遍更安全。
+            if is_active_ask and (
+                active_ask_last_text or active_ask_answered or active_ask_utterances
+            ):
+                kept = [
+                    doc
+                    for doc in reranked
+                    if not should_drop_retrieved_script(
+                        str(doc.get("text") or ""),
+                        last_active_ask=active_ask_last_text,
+                        answered_asks=active_ask_answered,
+                        customer_utterances=active_ask_utterances,
+                    )
+                ]
+                dropped = len(reranked) - len(kept)
+                if dropped:
+                    logger.info(
+                        "主动招呼已丢弃与已问过/已说过重合的话术: dropped=%d kept=%d last_ask=%s answered=%d utterances=%d",
+                        dropped,
+                        len(kept),
+                        (active_ask_last_text[:24] + "…") if len(active_ask_last_text) > 24 else active_ask_last_text,
+                        len(active_ask_answered),
+                        len(active_ask_utterances),
+                    )
+                reranked = kept
+
             ctx_threshold = active_ask_vector_threshold if is_active_ask else vector_threshold
             context = build_context(reranked, vector_threshold=ctx_threshold)
             should_ask_name = False
@@ -849,9 +912,11 @@ class RAGService:
             timings["retrieve"] + timings["rerank"] + timings["build_context_prompt"]
         )
 
-        # ── 语言规则库：根据本轮 query 自动标记已完成的观车环节 ──────────────
+        # ── 语言规则库：根据本轮顾客原话标记环节，并写入原话档案 ──────────────
+        # 主动询问指令不是顾客话，跳过。原话原样保存，不做槽位抽取。
         auto_steps: List[str] = []
         if vid and not is_obtain_name and not is_active_ask:
+            self.visitor_state.record_customer_utterance(vid, raw_query)
             auto_steps = detect_completed_steps(query=raw_query)
             if auto_steps:
                 for step_id in auto_steps:

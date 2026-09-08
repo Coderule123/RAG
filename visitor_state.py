@@ -65,6 +65,7 @@ DEFAULT_TOUR_STEPS: List[Dict[str, Any]] = [
 ]
 
 _UNSAFE_FILENAME_PATTERN = re.compile(r"[^\w\-.]")
+_INTENT_TAG_PATTERN = re.compile(r"<INTENT>.*?</INTENT>", re.IGNORECASE | re.DOTALL)
 
 # 中控主动询问的系统指令，不是顾客原话，不得用来标记阶段/喜好
 _ACTIVE_ASK_QUERY_PREFIX = "请求主动询问"
@@ -73,6 +74,15 @@ _ACTIVE_ASK_QUERY_PREFIX = "请求主动询问"
 _ICEBREAKER_STEP_IDS = frozenset({"greeting", "interest_probe"})
 # 收尾阶段：不能因为问过价格/问得多就跳进来；须前面中间环节都走完
 _LATE_FUNNEL_STEP_IDS = frozenset({"deal_confirmation", "contact_retention"})
+
+# 顾客原话滚动窗口。主动询问时从这里读，不依赖 LangGraph max_tokens 是否还留着同一句。
+MAX_CUSTOMER_UTTERANCES = 8
+# 已经问过并得到回答的主动问。检索时用原句重合度丢掉同义话术，主题不限。
+MAX_ANSWERED_ASKS = 6
+# 最近若干句主动问原文（含尚未被顾客回答的）。连续主动问时上一句不会被覆盖后丢掉。
+MAX_RECENT_ASKS = 6
+# 写入档案的主动问原文上限，避免 prompt 被长句占满。
+MAX_ACTIVE_ASK_CHARS = 120
 
 
 def _is_system_active_ask_query(query: str) -> bool:
@@ -131,6 +141,20 @@ def _empty_interest_profile() -> Dict[str, Any]:
     }
 
 
+def _empty_customer_memory() -> Dict[str, Any]:
+    """顾客原话档案：原句列表 + 已问答对 + 最近主动问原文。不存封闭标签。"""
+    return {
+        "utterances": [],
+        "answered_asks": [],
+        "recent_asks": [],
+    }
+
+
+def _empty_last_active_ask() -> Dict[str, Any]:
+    """上一句主动询问原文。下一轮禁止同义反复；顾客开口后会再记进 answered_asks。"""
+    return {"text": "", "asked_at": None}
+
+
 def _default_user_state(vision_id: str, tour_steps: List[Dict[str, Any]]) -> Dict[str, Any]:
     now = time.time()
     return {
@@ -143,11 +167,13 @@ def _default_user_state(vision_id: str, tour_steps: List[Dict[str, Any]]) -> Dic
             "steps": [_empty_step(step) for step in tour_steps],
         },
         "interest_profile": _empty_interest_profile(),
+        "customer_memory": _empty_customer_memory(),
+        "last_active_ask": _empty_last_active_ask(),
     }
 
 
 class VisitorStateStore:
-    """按 vision_user_id 独立维护用户状态：姓名、导购阶段进度、车型喜好感知。"""
+    """按 vision_user_id 独立维护用户状态：姓名、导购阶段、车型喜好、顾客原话档案。"""
 
     def __init__(
         self,
@@ -219,7 +245,75 @@ class VisitorStateStore:
         state["interest_profile"] = self._normalize_interest_profile(
             raw.get("interest_profile")
         )
+        state["customer_memory"] = self._normalize_customer_memory(
+            raw.get("customer_memory")
+        )
+        state["last_active_ask"] = self._normalize_last_active_ask(
+            raw.get("last_active_ask")
+        )
         return state
+
+    @staticmethod
+    def _normalize_customer_memory(raw: Any) -> Dict[str, Any]:
+        memory = _empty_customer_memory()
+        if not isinstance(raw, dict):
+            return memory
+        utterances: List[Dict[str, Any]] = []
+        for item in raw.get("utterances") or []:
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("text") or "").strip()
+            if not text:
+                continue
+            entry: Dict[str, Any] = {"text": text, "recorded_at": None}
+            recorded_at = item.get("recorded_at")
+            if isinstance(recorded_at, (int, float)):
+                entry["recorded_at"] = float(recorded_at)
+            utterances.append(entry)
+        memory["utterances"] = utterances[-MAX_CUSTOMER_UTTERANCES:]
+
+        answered: List[Dict[str, Any]] = []
+        for item in raw.get("answered_asks") or []:
+            if not isinstance(item, dict):
+                continue
+            ask = str(item.get("ask") or "").strip()
+            reply = str(item.get("reply") or "").strip()
+            if not ask or not reply:
+                continue
+            entry = {"ask": ask, "reply": reply, "recorded_at": None}
+            recorded_at = item.get("recorded_at")
+            if isinstance(recorded_at, (int, float)):
+                entry["recorded_at"] = float(recorded_at)
+            answered.append(entry)
+        memory["answered_asks"] = answered[-MAX_ANSWERED_ASKS:]
+
+        recent: List[Dict[str, Any]] = []
+        for item in raw.get("recent_asks") or []:
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("text") or "").strip()
+            if not text:
+                continue
+            entry = {"text": text, "asked_at": None}
+            asked_at = item.get("asked_at")
+            if isinstance(asked_at, (int, float)):
+                entry["asked_at"] = float(asked_at)
+            recent.append(entry)
+        memory["recent_asks"] = recent[-MAX_RECENT_ASKS:]
+        return memory
+
+    @staticmethod
+    def _normalize_last_active_ask(raw: Any) -> Dict[str, Any]:
+        result = _empty_last_active_ask()
+        if not isinstance(raw, dict):
+            return result
+        text = str(raw.get("text") or "").strip()
+        if text:
+            result["text"] = text
+        asked_at = raw.get("asked_at")
+        if isinstance(asked_at, (int, float)):
+            result["asked_at"] = float(asked_at)
+        return result
 
     @staticmethod
     def _normalize_interest_profile(raw: Any) -> Dict[str, Any]:
@@ -451,8 +545,16 @@ class VisitorStateStore:
         profile = state.get("interest_profile") or {}
         vehicles = profile.get("vehicles") if isinstance(profile, dict) else {}
         has_vehicle_interest = bool(isinstance(vehicles, dict) and vehicles)
-        already_engaged = bool(asked_ids) or has_vehicle_interest
+        has_name = bool(str(state.get("person_name") or "").strip())
+        has_utterances = bool(self.get_customer_utterances(vision_id))
+        already_engaged = (
+            bool(asked_ids)
+            or has_vehicle_interest
+            or has_name
+            or has_utterances
+        )
         later_than_icebreaker = bool(asked_ids - _ICEBREAKER_STEP_IDS)
+        skip_interest_probe = has_vehicle_interest or later_than_icebreaker
 
         for step in steps:
             if step.get("asked"):
@@ -460,7 +562,7 @@ class VisitorStateStore:
             sid = str(step.get("id") or "")
             if sid == "greeting" and already_engaged:
                 continue
-            if sid == "interest_probe" and (has_vehicle_interest or later_than_icebreaker):
+            if sid == "interest_probe" and skip_interest_probe:
                 continue
             if sid in _LATE_FUNNEL_STEP_IDS:
                 earlier_pending = any(
@@ -483,6 +585,9 @@ class VisitorStateStore:
         done = [str(step.get("title") or step["id"]) for step in steps if step.get("asked")]
         pending = [str(step.get("title") or step["id"]) for step in steps if not step.get("asked")]
         person_name = str(state.get("person_name") or "").strip()
+        utterances = self.get_customer_utterances(vision_id)
+        answered_asks = self.get_answered_asks(vision_id)
+        last_ask = state.get("last_active_ask") if isinstance(state.get("last_active_ask"), dict) else {}
         return {
             "person_name": person_name,
             "done_titles": done,
@@ -492,7 +597,11 @@ class VisitorStateStore:
                 str(next_step.get("title") or next_step["id"]) if next_step else ""
             ),
             "interest_summary": self.get_interest_summary(vision_id),
-            "is_new_visitor": len(done) == 0,
+            "is_new_visitor": len(done) == 0 and not person_name and not utterances,
+            "customer_utterances": utterances,
+            "answered_asks": answered_asks,
+            "last_active_ask_text": str(last_ask.get("text") or "").strip(),
+            "recent_ask_texts": self.get_recent_ask_texts(vision_id),
         }
 
     def mark_next_tour_step(self, vision_id: str) -> Optional[str]:
@@ -543,10 +652,10 @@ class VisitorStateStore:
         """
         from RAG.tour_lang_rules import detect_completed_steps, steps_summary
 
-        del response
         if _is_system_active_ask_query(query):
             return []
 
+        self.record_customer_utterance(vision_id, query)
         matched = detect_completed_steps(query=query)
         newly_marked: List[str] = []
         for step_id in matched:
@@ -564,6 +673,135 @@ class VisitorStateStore:
             vehicle_tags=vehicle_tags,
         )
         return newly_marked
+
+    def get_customer_utterances(self, vision_id: str) -> List[str]:
+        """最近若干句顾客原话，按时间从旧到新。"""
+        state = self.get_or_create(vision_id)
+        memory = state.get("customer_memory") if isinstance(state, dict) else {}
+        items = memory.get("utterances") if isinstance(memory, dict) else []
+        if not isinstance(items, list):
+            return []
+        return [
+            str(item.get("text") or "").strip()
+            for item in items
+            if isinstance(item, dict) and str(item.get("text") or "").strip()
+        ]
+
+    def get_answered_asks(self, vision_id: str) -> List[Dict[str, str]]:
+        """已经问过并得到回答的主动问（ask=当时问句，reply=顾客原话）。"""
+        state = self.get_or_create(vision_id)
+        memory = state.get("customer_memory") if isinstance(state, dict) else {}
+        items = memory.get("answered_asks") if isinstance(memory, dict) else []
+        if not isinstance(items, list):
+            return []
+        out: List[Dict[str, str]] = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            ask = str(item.get("ask") or "").strip()
+            reply = str(item.get("reply") or "").strip()
+            if ask and reply:
+                out.append({"ask": ask, "reply": reply})
+        return out
+
+    def get_recent_ask_texts(self, vision_id: str) -> List[str]:
+        """最近若干句主动问原文，含尚未被顾客回答的。供检索丢掉换皮同问。"""
+        state = self.get_or_create(vision_id)
+        memory = state.get("customer_memory") if isinstance(state, dict) else {}
+        items = memory.get("recent_asks") if isinstance(memory, dict) else []
+        if not isinstance(items, list):
+            return []
+        return [
+            str(item.get("text") or "").strip()
+            for item in items
+            if isinstance(item, dict) and str(item.get("text") or "").strip()
+        ]
+
+    def record_customer_utterance(self, vision_id: str, query: str) -> bool:
+        """
+        记下顾客原话。若上一句主动问还在，同时记成「已问过并得到回答」。
+
+        不解析这句话是用途、预算还是车型，原样保存。返回是否写入。
+        """
+        from RAG.customer_memory import is_recordable_utterance
+
+        if _is_system_active_ask_query(query) or not is_recordable_utterance(query):
+            return False
+        text = (query or "").strip()
+        state = self.get_or_create(vision_id)
+        memory = state.setdefault("customer_memory", _empty_customer_memory())
+        if not isinstance(memory.get("utterances"), list):
+            memory["utterances"] = []
+        if not isinstance(memory.get("answered_asks"), list):
+            memory["answered_asks"] = []
+
+        last_texts = [
+            str(item.get("text") or "")
+            for item in memory["utterances"]
+            if isinstance(item, dict)
+        ]
+        if last_texts and last_texts[-1] == text:
+            return False
+
+        now = time.time()
+        memory["utterances"].append({"text": text, "recorded_at": now})
+        memory["utterances"] = memory["utterances"][-MAX_CUSTOMER_UTTERANCES:]
+
+        # 上一句主动问只配对紧接着的一句顾客原话，配对后立刻消费，
+        # 避免下一句无关原话被挂到同一个问句上。
+        last_ask = state.get("last_active_ask") if isinstance(state.get("last_active_ask"), dict) else {}
+        ask_text = str(last_ask.get("text") or "").strip()
+        if ask_text:
+            memory["answered_asks"].append(
+                {"ask": ask_text, "reply": text, "recorded_at": now}
+            )
+            memory["answered_asks"] = memory["answered_asks"][-MAX_ANSWERED_ASKS:]
+            state["last_active_ask"] = _empty_last_active_ask()
+
+        self.save(vision_id, state)
+        logger.info(
+            "已记录顾客原话: vision_user_id=%s text=%s paired_ask=%s",
+            vision_id,
+            text,
+            bool(ask_text),
+        )
+        return True
+
+    def record_last_active_ask(self, vision_id: str, text: str) -> None:
+        """记下本轮主动询问原文，并写入 recent_asks。
+
+        last_active_ask 表示「还等顾客回答的那一句」；顾客开口后会被消费。
+        recent_asks 保留最近若干句，避免连续主动问时上一句被覆盖后无法过滤。
+        """
+        cleaned = _INTENT_TAG_PATTERN.sub("", text or "").strip()
+        cleaned = re.sub(r"\s+", " ", cleaned)
+        if not cleaned:
+            return
+        if len(cleaned) > MAX_ACTIVE_ASK_CHARS:
+            cleaned = cleaned[:MAX_ACTIVE_ASK_CHARS]
+        state = self.get_or_create(vision_id)
+        now = time.time()
+        state["last_active_ask"] = {
+            "text": cleaned,
+            "asked_at": now,
+        }
+        memory = state.setdefault("customer_memory", _empty_customer_memory())
+        if not isinstance(memory.get("recent_asks"), list):
+            memory["recent_asks"] = []
+        prev = [
+            str(item.get("text") or "")
+            for item in memory["recent_asks"]
+            if isinstance(item, dict)
+        ]
+        if not prev or prev[-1] != cleaned:
+            memory["recent_asks"].append({"text": cleaned, "asked_at": now})
+            memory["recent_asks"] = memory["recent_asks"][-MAX_RECENT_ASKS:]
+        self.save(vision_id, state)
+        logger.info(
+            "已记录上一句主动询问: vision_user_id=%s text=%s",
+            vision_id,
+            cleaned,
+        )
 
     def get_last_vehicle_tag(self, vision_id: str) -> Optional[str]:
         state = self.get_or_create(vision_id)
