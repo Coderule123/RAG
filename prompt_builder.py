@@ -284,12 +284,13 @@ def _build_completeness_gate_lines() -> str:
 
 
 def _build_natural_oral_style_lines() -> str:
-    """引导 LLM 将资料改写为自然导购口语，避免照抄检索原文。"""
+    """引导 LLM 将资料改写为自然导购口语，避免照抄检索原文与 Markdown。"""
     return (
-        "【输出风格 — 自然口语】\n"
-        "参考【资料】中的事实信息与导购意图作答，但必须改写为面向顾客的自然口语，"
-        "禁止照搬原文、禁止罗列条目、禁止像念稿。"
-        "语气应像站在展车旁的真实导购，亲切自然、简洁有条理。\n"
+        "【输出风格 — 自然口语，与系统提示一致】\n"
+        "必须改写为面向顾客的自然口语，禁止照搬原文、禁止罗列条目、禁止像念稿。\n"
+        "正文必须可直接播报：用逗号、句号连接，禁止 Markdown。"
+        "禁止 **加粗**、*斜体*、# 标题、-/* /1. 列表，禁止空行和连续换行。\n"
+        "多个要点连成一两句话，例如「52 度那款、66 度那款」。\n"
     )
 
 
@@ -1101,10 +1102,12 @@ def build_prompt(
     closing = (
         "若【问题】语义不完整：整段只输出 <INTENT>INCOMPLETE</INTENT>，不要根据【资料】作答。\n"
         f"若【问题】语义完整：请严格以 <INTENT> 标签开头{location_reminder}，"
-        "针对本轮【问题】基于【资料】作答；历史话题只可在结尾用一句反问或推荐带过："
+        "针对本轮【问题】基于【资料】作答；历史话题只可在结尾用一句反问或推荐带过。"
+        "正文用口语逗号、句号连接，禁止 Markdown、星号加粗、列表和空行："
     )
     completeness_line = _build_completeness_gate_lines()
     history_line = _build_conversation_history_usage_lines()
+    style_line = _build_natural_oral_style_lines()
 
     # 5. 检索资料 + 当前问题：每次 query 都变，放在最后
     template = (
@@ -1113,6 +1116,7 @@ def build_prompt(
         "{vehicle_reference_line}"
         "{visit_line}"
         "{history_line}"
+        "{style_line}"
         "{completeness_line}"
         "【资料】\n"
         "{context}\n"
@@ -1129,6 +1133,7 @@ def build_prompt(
         vehicle_reference_line=vehicle_reference_line,
         visit_line=visit_line,
         history_line=history_line,
+        style_line=style_line,
         completeness_line=completeness_line,
         context=context,
         question=query,
