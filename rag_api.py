@@ -26,7 +26,7 @@ from RAG.DP.embedding_service import (
 )
 
 from .context_builder import build_context
-from .query_normalize import strip_leading_fillers
+from .query_normalize import prefix_vehicle_names_for_retrieval, strip_leading_fillers
 from .prompt_builder import (
     DEFAULT_ACTIVE_ASK_RETRIEVAL_QUERY,
     DEFAULT_GREETING_LOCATION_LABEL,
@@ -711,6 +711,21 @@ class RAGService:
         if resolved_tags and not is_active_ask and _GENERAL_TAG not in resolved_tags:
             resolved_tags = resolved_tags + [_GENERAL_TAG]
             logger.info("叠加 general tag，最终检索 tag: %s", resolved_tags)
+
+        # 检索词加车名前缀：仅普通对话；general / active_ask 不加。LLM 仍看 raw_query。
+        if not is_active_ask and not is_obtain_name:
+            prefixed = prefix_vehicle_names_for_retrieval(
+                retrieve_query,
+                tags=resolved_tags,
+                display_names=VEHICLE_TAG_DISPLAY_NAMES,
+            )
+            if prefixed != retrieve_query:
+                logger.info(
+                    "检索 query 已加车型前缀: %r -> %r",
+                    retrieve_query,
+                    prefixed,
+                )
+                retrieve_query = prefixed
 
         user_state: Optional[Dict[str, Any]] = None
         if vid:
