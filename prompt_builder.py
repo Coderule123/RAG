@@ -268,6 +268,21 @@ def _build_robot_capability_boundary_lines() -> str:
     )
 
 
+def _build_completeness_gate_lines() -> str:
+    """与 default_system_prompt 第零步对齐：完整度只看用户文本，资料不得改判。"""
+    return (
+        "【语义完整度 — 先于资料，与系统提示第零步一致】\n"
+        "完整度只看【问题】本身，【资料】不得改变判定。\n"
+        "已经能当一轮问题或请求来回答的，判完整并基于【资料】作答；"
+        "只有明显被切断、还接不上意图的，才整段输出 <INTENT>INCOMPLETE</INTENT>。\n"
+        "不要因为「后面还能再接几个字」、句首有「嗯/呃」，"
+        "或【资料】里恰好有对应介绍，就把完整问句判成半句。\n"
+        "真半句示例：我想去、这款车的中控、智己LS6的。\n"
+        "完整问句示例：这个多大呀、有没有这个、介绍一下这个、"
+        "嗯那你给我介绍一下这个、这个是多少。\n"
+    )
+
+
 def _build_natural_oral_style_lines() -> str:
     """引导 LLM 将资料改写为自然导购口语，避免照抄检索原文。"""
     return (
@@ -287,14 +302,11 @@ def _build_conversation_history_usage_lines() -> str:
     """
     return (
         "【对话历史 — 使用方式】\n"
-        "当前会话上下文中已包含基于人脸 ID 恢复的历史 HumanMessage/AIMessage，"
-        "请直接阅读这些消息作为对这位用户的记忆。\n"
-        "这些历史消息是作答和追问的第一准绳，优先于本轮【资料】。"
-        "用户已经问过、已经确认或已经得到回答的信息，不要再次追问或换一种说法再问；"
-        "应自然承接（例如「刚才您关注的……」），表现出记得对方此前说过什么。\n"
-        "当用户本轮使用「这个」「刚才那个」「它」「还有呢」等省略表达，"
-        "或未明确说明车型、版本、配置、预算、用途等主语时，"
-        "优先结合上述历史消息补全语义，再结合【资料】作答；"
+        "本轮【问题】若是明确的新提问或新请求，必须只针对该新问题作答，"
+        "禁止把历史里的旧话题当成本题来回答。\n"
+        "历史记录只用于：省略指代时补全对象；以及正文答完后，"
+        "在末尾用一句反问或推荐轻轻带一下历史关注点。\n"
+        "禁止开场就说「刚才您关注的……」来接旧题；"
         "不要把历史来源说成数据库、记录或系统信息。\n"
     )
 
@@ -999,13 +1011,15 @@ def build_prompt(
     """
     组装 RAG user-message 提示词字符串（不含固定系统规则）。
 
-    固定不变的内容（身份、语义完整度规则、意图标签定义、能力边界、
-    事实准确性、口语风格、对话历史用法）已写入 default_system_prompt，此处仅注入动态上下文：
+    固定不变的内容（身份、意图标签定义、能力边界、
+    事实准确性、口语风格、对话历史用法）已写入 default_system_prompt。
+    语义完整度主规则在 default_system_prompt 第零步；此处再注入完整度提醒与历史使用方式，
+    避免【资料】或旧对话把本轮新问题带偏。此外仅注入动态上下文：
     1. 访客身份（vision_user_id / vision_user_name）
     2. 机器人当前位置（robot_location_tags）
     3. 单一车型口径（active_tags / robot_location_tags）
     4. 参观意向 + 预设导航地点（query 中检测到参观意向时注入）
-    5. 本轮检索资料（context）+ 当前问题（query）
+    5. 历史使用方式 + 完整度提醒 + 本轮检索资料（context）+ 当前问题（query）
 
     各块按"变化频率从小到大"排列，以最大化前缀缓存命中率。
     """
@@ -1084,7 +1098,13 @@ def build_prompt(
     else:
         location_reminder = "（本次禁止输出 <LOCATION> 标签）" if is_visit_intent_query(query) else ""
 
-    closing = f"请严格以 <INTENT> 标签开头{location_reminder}，基于【资料】输出回答："
+    closing = (
+        "若【问题】语义不完整：整段只输出 <INTENT>INCOMPLETE</INTENT>，不要根据【资料】作答。\n"
+        f"若【问题】语义完整：请严格以 <INTENT> 标签开头{location_reminder}，"
+        "针对本轮【问题】基于【资料】作答；历史话题只可在结尾用一句反问或推荐带过："
+    )
+    completeness_line = _build_completeness_gate_lines()
+    history_line = _build_conversation_history_usage_lines()
 
     # 5. 检索资料 + 当前问题：每次 query 都变，放在最后
     template = (
@@ -1092,6 +1112,8 @@ def build_prompt(
         "{robot_location_line}"
         "{vehicle_reference_line}"
         "{visit_line}"
+        "{history_line}"
+        "{completeness_line}"
         "【资料】\n"
         "{context}\n"
         "\n"
@@ -1106,6 +1128,8 @@ def build_prompt(
         robot_location_line=robot_location_line,
         vehicle_reference_line=vehicle_reference_line,
         visit_line=visit_line,
+        history_line=history_line,
+        completeness_line=completeness_line,
         context=context,
         question=query,
         closing=closing,
