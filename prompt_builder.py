@@ -230,6 +230,21 @@ def _resolve_single_vehicle_tag(
     return unique[0] if len(unique) == 1 else None
 
 
+def _build_empty_context_lines() -> str:
+    """资料为空时禁止编造参数，也不要生硬说不知道，改为导购式迂回。"""
+    return (
+        "【资料为空 — 本轮未命中可引用参数】\n"
+        "本轮【资料】没有可用片段，等于手头没有对上这项具体数字或配置。\n"
+        "禁止用常识、训练记忆或对话历史编造：价格、尺寸、容积、续航、"
+        "动力形式（纯电/增程/燃油）、有无油箱、屏幕规格等任何具体参数。\n"
+        "禁止假装已经知道答案，也禁止生硬说「我不知道」「抱歉无法回答」"
+        "「资料不足」「没有查到」这类系统口吻。\n"
+        "请像展厅导购一样迂回：先接住顾客的问题，说明这一项需要对照门店配置表，"
+        "避免说错；再自然请用户主理人帮忙确认，或转问你有把握、且不涉及编造数字的相关体验。"
+        "不要把「没对上参数」说成系统检索失败。\n"
+    )
+
+
 def _build_factual_accuracy_lines() -> str:
     """引导 LLM 严守资料边界，禁止凭营销话术或常识推断配置事实。"""
     return (
@@ -247,6 +262,7 @@ def _build_factual_accuracy_lines() -> str:
         "禁止将5座车型说成有三排，或将「3个零重力座椅」说成「第三排零重力」。\n"
         "若【资料】只介绍功能特点但未写明配备位置或版本，"
         "只回答功能本身，并说明「具体以当前门店配置表为准」。\n"
+        "若本轮【资料】为空，适用【资料为空】规则：不编造、不装懂、不生硬拒绝。\n"
     )
 
 
@@ -1108,6 +1124,10 @@ def build_prompt(
     completeness_line = _build_completeness_gate_lines()
     history_line = _build_conversation_history_usage_lines()
     style_line = _build_natural_oral_style_lines()
+    context_text = (context or "").strip()
+    empty_context_line = _build_empty_context_lines() if not context_text else ""
+    if not context_text:
+        logger.info("本轮【资料】为空，已注入迂回作答约束")
 
     # 5. 检索资料 + 当前问题：每次 query 都变，放在最后
     template = (
@@ -1118,6 +1138,7 @@ def build_prompt(
         "{history_line}"
         "{style_line}"
         "{completeness_line}"
+        "{empty_context_line}"
         "【资料】\n"
         "{context}\n"
         "\n"
@@ -1135,6 +1156,7 @@ def build_prompt(
         history_line=history_line,
         style_line=style_line,
         completeness_line=completeness_line,
+        empty_context_line=empty_context_line,
         context=context,
         question=query,
         closing=closing,

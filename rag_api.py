@@ -20,9 +20,13 @@ from typing import Any, Dict, List, Optional, Tuple
 from RAG.config.config_runtime import load_config
 from RAG.config.hf_runtime import setup_huggingface_env
 from RAG.config.logger_runtime import get_logger, setup_logging
-from RAG.DP.embedding_service import EmbeddingService
+from RAG.DP.embedding_service import (
+    DEFAULT_BGE_ZH_QUERY_INSTRUCTION,
+    EmbeddingService,
+)
 
 from .context_builder import build_context
+from .query_normalize import strip_leading_fillers
 from .prompt_builder import (
     DEFAULT_ACTIVE_ASK_RETRIEVAL_QUERY,
     DEFAULT_GREETING_LOCATION_LABEL,
@@ -320,10 +324,15 @@ class RAGService:
         )
 
         # 初始化 Embedding 服务（与建库同模型）
+        # 查询前缀只作用于 embed_query，入库仍走 embed_documents，无需重建索引
         self.embed_service = EmbeddingService(
             model_name=models.get("embedding_model", "BAAI/bge-small-zh-v1.5"),
             sentence_cache_dir=hf_runtime["sentence_cache_dir"],
             local_files_only=bool(hf_cfg.get("local_files_only", False)),
+            use_query_instruction=bool(models.get("use_query_instruction", False)),
+            query_instruction=str(
+                models.get("query_instruction", DEFAULT_BGE_ZH_QUERY_INSTRUCTION)
+            ),
         )
 
         # 初始化检索器（加载 FAISS 索引）
@@ -646,7 +655,13 @@ class RAGService:
                 active_ask_stage_hint,
             )
         else:
-            retrieve_query = raw_query
+            retrieve_query = strip_leading_fillers(raw_query)
+            if retrieve_query != raw_query:
+                logger.info(
+                    "检索 query 已去掉句首语气词: %r -> %r",
+                    raw_query,
+                    retrieve_query,
+                )
             visit_locations = self.config.get("visit_locations")
             detected = self._detect_tags_from_query(raw_query)
 
@@ -931,7 +946,7 @@ class RAGService:
 
         result = {
             "query": raw_query,
-            "retrieve_query": retrieve_query if is_active_ask else raw_query,
+            "retrieve_query": retrieve_query,
             "retrieved_docs": retrieved,
             "reranked_docs": reranked,
             "context": context,

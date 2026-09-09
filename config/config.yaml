@@ -18,6 +18,10 @@ paths:
 models:
   embedding_model: "BAAI/bge-small-zh-v1.5" # 查询向量与 FAISS 建库用同一套
   reranker_model: "BAAI/bge-reranker-v2-m3" # CrossEncoder 精排
+  # 查询向量是否加 BGE 官方检索前缀；文档入库始终不加。默认关闭。
+  # 打开后分数分布会变，需回归 retrieval.vector_threshold，不要与阈值调整绑在一起上线。
+  use_query_instruction: false
+  query_instruction: "为这个句子生成表示以用于检索相关文章："
 
 # 检索与重排（RAG/rag_api.py 可用 CLI 覆盖）
 retrieval:
