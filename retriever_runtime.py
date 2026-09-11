@@ -39,7 +39,7 @@ class RetrieverRuntime:
         tags：若不为空则只保留 metadata.tag 在列表中的结果。
         由于 FAISS 不支持原生 metadata 过滤，启用 tag 过滤时会先召回
         top_k * _TAG_FETCH_MULTIPLIER 条候选再后过滤，以保证结果充足。
-        重复片段（doc_id+chunk_id 相同）的 text 字段置空。
+        重复片段（source+doc_id+chunk_id 相同）的 text 字段置空，仍保留该槽位便于排查。
         """
         tag_set: Optional[set] = (
             {t.lower() for t in tags if t} if tags else None
@@ -66,7 +66,11 @@ class RetrieverRuntime:
         seen: set = set()
         for doc, score in raw:
             metadata = doc.metadata
-            key = (metadata.get("doc_id"), metadata.get("chunk_id"))
+            key = (
+                metadata.get("source"),
+                metadata.get("doc_id"),
+                metadata.get("chunk_id"),
+            )
             text = "" if key in seen else doc.page_content
             if text:
                 seen.add(key)
